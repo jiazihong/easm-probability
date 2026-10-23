@@ -1,0 +1,36 @@
+name: monthly monsoon report
+
+on:
+  schedule:
+    # 每月 8 日 02:00 UTC（ONI/SOI 逐月更新，SCSMI 每年夏季结束后由源站点更新）
+    - cron: '0 2 8 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 抓取最新 SCSMI / ONI / SOI 数据
+        run: python monsoon_prob.py update
+      - name: 自测
+        run: python monsoon_prob.py selftest
+      - name: 生成可视化报告（docs/index.html）
+        run: python monsoon_prob.py report --out docs/index.html
+      - name: 提交变更
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/scsmi_cache.txt data/oni_cache.csv data/soi_cache.txt docs/index.html
+          if git diff --cached --quiet; then
+            echo "no changes"
+          else
+            git commit -m "auto: monthly monsoon report refresh"
+            git push
+          fi
