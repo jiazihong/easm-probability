@@ -32,6 +32,21 @@ python monsoon_prob.py selftest
 
 需要 Python 3.9+。没有网络时可加 `--offline` 直接用 `data/` 下的缓存。
 
+## 自动化（GitHub Actions + Pages）
+
+仓库内置月度自动化工作流 `.github/workflows/monthly-report.yml`：每月 8 日自动抓取
+SCSMI / ONI / SOI 最新数据、运行自测、把可视化报告生成到 `docs/index.html` 并提交回仓库。
+手动触发与本地等价命令：
+
+```bash
+python monsoon_prob.py update
+python monsoon_prob.py selftest
+python monsoon_prob.py report --out docs/index.html
+```
+
+Pages 已按 **Source = main / /docs** 配置，报告页地址：
+`https://jiazihong.github.io/easm-probability/`（每次工作流提交后自动刷新）。
+
 ## 目标变量与状态判定
 
 | 项目 | 说明 |
@@ -146,8 +161,9 @@ python monsoon_prob.py selftest
 easm-probability/
 ├── monsoon_prob.py                # 主程序（含 91 项自测模块）
 ├── data/                          # 数据快照（SCSMI/ONI/SOI，离线可用）
-├── output/                        # 运行时生成（forecast.json / monsoon_report.html）
+├── output/                        # 运行时生成（forecast.json / monsoon_report.html，已 gitignore）
 ├── docs/index.html                # GitHub Pages 用静态报告（由 --out 生成）
+├── .github/workflows/             # 月度自动化工作流
 └── README.md
 ```
 
