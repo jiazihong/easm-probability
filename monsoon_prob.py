@@ -15,7 +15,7 @@
 
 方法沿用姊妹项目 enso-probability 的架构：
   1. 状态转移模型：P(今年季风态 | 去年季风态, 起报时 ENSO 态)，Dirichlet 先验
-  2. 历史相似型模型：13 维特征（经滚动标准化）欧氏距离 + 高斯核加权
+  2. 历史相似型模型：多维特征（6 月 ONI + 6 月 SOI + 6 月 DMI 轨迹 + 前一年 SCSMI，经滚动标准化）欧氏距离 + 高斯核加权
   3. 起报月分层 + 经验贝叶斯收缩：p = λ·p_同月 + (1-λ)·p_全历史，λ = n/(n+24)
   4. 组合权重按样本外三分类 Brier 技能分分配，负技能剔除，双负退化等权
   5. 90% 区间来自 Dirichlet 蒙特卡洛抽样（固定种子）
@@ -60,6 +60,11 @@ SCSMI_URL = "http://lijianping.cn/dct/attach/Y2xiOmNsYjpBU0NJSTo4NzY="
 ONI_CACHE = os.path.join(DATA_DIR, "oni_cache.csv")
 SOI_CACHE = os.path.join(DATA_DIR, "soi_cache.txt")
 SCSMI_CACHE = os.path.join(DATA_DIR, "scsmi_cache.txt")
+
+# 印度洋偶极子 DMI（西印度洋-东印度洋海温距平差）：NOAA PSL 月指数文本
+# （基于 HadISST，1870-至今），作为季风的第三类外强迫因子（IOD 影响南海季风爆发与强度）。
+DMI_URL = "https://psl.noaa.gov/gcos_wgsp/Timeseries/Data/dmi.had.long.data"
+DMI_CACHE = os.path.join(DATA_DIR, "dmi_monthly_cache.txt")
 
 # 南海季风爆发日期：NCEP/NCAR R1 逐日 850hPa 纬向风（PSL THREDDS OPeNDAP 文本子集），
 # 区域 (10°-20°N, 110°-120°E)（南海中北部，主流文献与业务监测口径）候平均，
@@ -347,6 +352,29 @@ def parse_scsmi(text):
     return out
 
 
+def parse_dmi(text):
+    """解析 PSL DMI 月指数文本 -> {(年, 月): 值}，-9999 视为缺失。
+    文件含表头（起止年）与页脚（Timeseries output...），按行年号过滤。"""
+    out = {}
+    for ln in text.splitlines():
+        m = re.match(r"^\s*(\d{4})(?:\s+|$)", ln)
+        if not m:
+            continue
+        try:
+            year = int(m.group(1))
+        except ValueError:
+            continue
+        if year < 1870 or year > 2100:
+            continue
+        vals = re.findall(r"[-+]?\d+\.\d+", ln[m.end():])
+        if len(vals) < 12:
+            continue
+        for i in range(12):
+            v = float(vals[i])
+            out[(year, i + 1)] = None if v <= -9990.0 else v
+    return out
+
+
 # ------------------------------------------------------------ 数据装载 ----
 
 def load_oni(allow_network=True):
@@ -362,6 +390,11 @@ def load_soi(allow_network=True):
 def load_scsmi(allow_network=True):
     text, _ = fetch_text(SCSMI_URL, SCSMI_CACHE, refresh=False, allow_network=allow_network)
     return parse_scsmi(text)
+
+
+def load_dmi(allow_network=True):
+    text, _ = fetch_text(DMI_URL, DMI_CACHE, refresh=False, allow_network=allow_network)
+    return parse_dmi(text)
 
 
 # ------------------------------------------------------------ 爆发日期 ----
@@ -708,7 +741,8 @@ def _onset_metrics(triples):
             "skill": skill, "hit_rate": hits / n}
 
 
-def onset_cross_validate(oni, soi, scsmi, seq, verify_start=ONSET_VERIFY_START):
+def onset_cross_validate(oni, soi, scsmi, seq, verify_start=ONSET_VERIFY_START,
+                         dmi=None):
     """爆发候样本外（时序）验证：逐年以当年之前的数据分别做
     气候态 / 相似型（起报 4 月）/ 线性回归预测，统计 r、MAE、相对气候态技能、
     距平符号命中率。相似型复用主预测的 4 月起报口径，候选年严格早于目标年。"""
@@ -720,9 +754,9 @@ def onset_cross_validate(oni, soi, scsmi, seq, verify_start=ONSET_VERIFY_START):
         # 相似型：起报 4 月（业务口径），目标同年
         ana = None
         if len(seq) >= 3:
-            a_pool = analog_distribution(oni, soi, scsmi, y_t, 4)
+            a_pool = analog_distribution(oni, soi, scsmi, y_t, 4, dmi=dmi)
             if a_pool is not None:
-                a_m_res, _, _ = monthly_analog(oni, soi, scsmi, y_t, 4)
+                a_m_res, _, _ = monthly_analog(oni, soi, scsmi, y_t, 4, dmi=dmi)
                 am = a_m_res or a_pool
                 ana = onset_analog_forecast(seq, am["years"], am["weights"])
         tri["analog"].append((ana["mean"] if ana else None, obs, clim))
@@ -734,7 +768,7 @@ def onset_cross_validate(oni, soi, scsmi, seq, verify_start=ONSET_VERIFY_START):
     return out
 
 
-def build_onset_result(oni, soi, scsmi, u850, y_t, comp):
+def build_onset_result(oni, soi, scsmi, u850, y_t, comp, dmi=None):
     """爆发日期全链结果（供 forecast/report 使用）：序列、统计、本轮两类预测、
     样本外验证。u850 缺失或无爆发年份时返回 None。"""
     seq = onset_series(u850)
@@ -753,7 +787,7 @@ def build_onset_result(oni, soi, scsmi, u850, y_t, comp):
         near = sorted((seq[y], y) for y, _ in ok if y in seq)[:5]
     reg = onset_reg_predict(oni, soi, seq, y_t)
     clim = _clim_before(seq, y_t)
-    cv = onset_cross_validate(oni, soi, scsmi, seq)
+    cv = onset_cross_validate(oni, soi, scsmi, seq, dmi=dmi)
     return {
         "target_year": y_t, "series": seq, "stats": stats,
         "analog": ana, "reg": reg, "clim": clim, "cv": cv,
@@ -764,11 +798,12 @@ def build_onset_result(oni, soi, scsmi, u850, y_t, comp):
 
 
 def update_data():
-    """update 子命令：刷新四个数据源并写缓存（U850 只补齐缺失年份）。"""
+    """update 子命令：刷新五个数据源并写缓存（U850 只补齐缺失年份）。"""
     print("刷新数据源：")
     for name, url, cache in [("ONI", ONI_URL, ONI_CACHE),
                              ("SOI", SOI_URL, SOI_CACHE),
-                             ("SCSMI", SCSMI_URL, SCSMI_CACHE)]:
+                             ("SCSMI", SCSMI_URL, SCSMI_CACHE),
+                             ("DMI", DMI_URL, DMI_CACHE)]:
         text, from_cache = fetch_text(url, cache, refresh=True, allow_network=True)
         print("  %-6s %s %s" % (name, "缓存回退" if from_cache else "OK", os.path.basename(cache)))
     data = _load_u850_cache()
@@ -881,40 +916,84 @@ def latest_soi(soi):
     return best
 
 
+def latest_dmi(dmi):
+    """最新一个非缺失 DMI 值 -> ((年, 月), 值)；无数据返回 None。"""
+    best = None
+    for (y, m), v in dmi.items():
+        if v is None:
+            continue
+        if best is None or (y, m) > best[0]:
+            best = ((y, m), v)
+    return best
+
+
 # ------------------------------------------------------------ 特征构造 ----
+
+ENSO_PHASES = [("D", "发展(增强)"), ("P", "峰值(平台)"), ("C", "衰减(减弱)"), ("N", "中性")]
+ENSO_PHASE_TREND = 0.2   # 3 个月 ONI 变化阈值（发展/衰减判定）
+
+
+def enso_phase_at(oni, y, m, win=6):
+    """起报 (y, m) 时点的 ENSO 发展阶段，只用 m 及之前的数据（无泄漏）。
+    以近 3 个月 ONI 趋势在 ±0.2 内判峰值平台：
+      'D' 发展（|ONI|≥0.5 且 3 个月变化 ≥ +0.2）
+      'C' 衰减（|ONI|≥0.5 且 3 个月变化 ≤ -0.2）
+      'P' 峰值（|ONI|≥0.5 且变化平缓）
+      'N' 中性（近 win 个月 |ONI| 全 < 0.5）
+    数据不足返回 None。"""
+    vals = [oni.get((yy, mm)) for yy, mm in prev_months(y, m, win)]  # 时间正序，末位=当月
+    vals = [v for v in vals if v is not None]
+    if len(vals) < 4:
+        return None
+    if all(abs(v) < 0.5 for v in vals):
+        return "N"
+    cur = vals[-1]
+    if abs(cur) < 0.5:
+        return "N"
+    delta = cur - vals[-4]
+    if delta >= ENSO_PHASE_TREND:
+        return "D"
+    if delta <= -ENSO_PHASE_TREND:
+        return "C"
+    return "P"
+
 
 def build_feature_axes(y, m):
     """起报 (年 y, 月 m) 的特征轴 id 列表：
-    6 个 ONI 月 + 6 个 SOI 月（截至 m-1）+ 前一年 SCSMI。"""
+    6 个 ONI 月 + 6 个 SOI 月 + 6 个 DMI 月（截至 m-1）+ 前一年 SCSMI。"""
     wins = prev_months(y, m - 1, WINDOW)
     axes = [("oni", yy, mm) for yy, mm in wins]
     axes += [("soi", yy, mm) for yy, mm in wins]
+    axes += [("dmi", yy, mm) for yy, mm in wins]
     axes += [("prev", y - 1)]
     return axes
 
 
-def axis_value(ax, oni, soi, scsmi, for_year):
+def axis_value(ax, oni, soi, scsmi, for_year, dmi=None):
     kind = ax[0]
     if kind == "oni":
         return oni.get((ax[1], ax[2]))
     if kind == "soi":
         return soi.get((ax[1], ax[2]))
+    if kind == "dmi":
+        return (dmi or {}).get((ax[1], ax[2]))
     return jjas_norm(scsmi, for_year - 1)
 
 
-def feature_vector(axes, oni, soi, scsmi, y):
-    return {ax: axis_value(ax, oni, soi, scsmi, y) for ax in axes}
+def feature_vector(axes, oni, soi, scsmi, y, dmi=None):
+    return {ax: axis_value(ax, oni, soi, scsmi, y, dmi) for ax in axes}
 
 
 # ------------------------------------------------------------ 模型样本池 ----
 
-POS_AXES = [("oni", k) for k in range(WINDOW)] + \
-           [("soi", k) for k in range(WINDOW)] + [("prev",)]
+POS_AXES = ([("oni", k) for k in range(WINDOW)] +
+            [("soi", k) for k in range(WINDOW)] +
+            [("dmi", k) for k in range(WINDOW)] + [("prev",)])
 
 _POOL_CACHE = {}
 
 
-def _build_pool(oni, soi, scsmi):
+def _build_pool(oni, soi, scsmi, dmi=None):
     """按数据身份构建一次性的模型样本池：
     t_rows: (目标年 T, 前一年状态, 当年状态)，以及各起报月 m2 的 ENSO 态
     a_rows: (目标年 T, 窗口结束月 w, 窗口 6 个月列表) —— w=1..5 同年、w=6..12 前一年"""
@@ -932,14 +1011,14 @@ def _build_pool(oni, soi, scsmi):
             Yw = T - 1 if w >= 6 else T
             a_rows.append((T, w, prev_months(Yw, w, WINDOW)))
     return {"t_rows": t_rows, "a_rows": a_rows, "st_map": st_map,
-            "oni": oni, "soi": soi, "scsmi": scsmi}
+            "oni": oni, "soi": soi, "scsmi": scsmi, "dmi": dmi or {}}
 
 
-def get_pool(oni, soi, scsmi):
-    key = (id(oni), id(soi), id(scsmi))
+def get_pool(oni, soi, scsmi, dmi=None):
+    key = (id(oni), id(soi), id(scsmi), id(dmi))
     p = _POOL_CACHE.get(key)
     if p is None:
-        p = _build_pool(oni, soi, scsmi)
+        p = _build_pool(oni, soi, scsmi, dmi)
         if len(_POOL_CACHE) > 12:
             _POOL_CACHE.pop(next(iter(_POOL_CACHE)))
         _POOL_CACHE[key] = p
@@ -1008,11 +1087,13 @@ def monthly_transition(oni, soi, scsmi, y_t, m, prior=PRIOR_STRENGTH):
 
 # ------------------------------------------------------------ 相似型模型 ----
 
-def _vec_from_months(oni, soi, scsmi, T, months):
+def _vec_from_months(oni, soi, scsmi, T, months, dmi=None):
     v = {}
+    dd = dmi or {}
     for k, (yy, mm) in enumerate(months):
         v[("oni", k)] = oni.get((yy, mm))
         v[("soi", k)] = soi.get((yy, mm))
+        v[("dmi", k)] = dd.get((yy, mm))
     v[("prev",)] = jjas_norm(scsmi, T - 1)
     return v
 
@@ -1020,9 +1101,10 @@ def _vec_from_months(oni, soi, scsmi, T, months):
 def _analog_core_pool(pool, y_t, m, phase, axes, min_candidates, bw_floor):
     """给定特征轴集合，从样本池计算高斯核加权状态概率与近邻明细。"""
     oni, soi, scsmi = pool["oni"], pool["soi"], pool["scsmi"]
+    dmi = pool.get("dmi") or {}
     Yw0, w0 = mon_norm(y_t - (1 if m >= 6 else 0), m - 1)
     q_months = prev_months(Yw0, w0, WINDOW)
-    qv = _vec_from_months(oni, soi, scsmi, y_t, q_months)
+    qv = _vec_from_months(oni, soi, scsmi, y_t, q_months, dmi)
     rows = []
     for T, w, months in pool["a_rows"]:
         if T >= y_t:
@@ -1032,7 +1114,7 @@ def _analog_core_pool(pool, y_t, m, phase, axes, min_candidates, bw_floor):
         rows.append((T, w, months))
     if len(rows) < min_candidates:
         return None
-    vecs = {i: _vec_from_months(oni, soi, scsmi, T, months)
+    vecs = {i: _vec_from_months(oni, soi, scsmi, T, months, dmi)
             for i, (T, w, months) in enumerate(rows)}
     mu, sd = {}, {}
     for ax in axes:
@@ -1084,14 +1166,16 @@ def _analog_core_pool(pool, y_t, m, phase, axes, min_candidates, bw_floor):
 
 
 def analog_distribution(oni, soi, scsmi, y_t, m,
-                        min_candidates=MIN_CANDIDATES, bw_floor=BW_FLOOR, phase=None):
+                        min_candidates=MIN_CANDIDATES, bw_floor=BW_FLOOR, phase=None,
+                        dmi=None):
     """历史相似型（phase=None 为全窗口混合，phase=w0 为同相）。
-    候选样本不足时逐级降维（去 SOI -> 去前一年 -> 仅 ONI）。"""
-    pool = get_pool(oni, soi, scsmi)
+    候选样本不足时逐级降维（去 DMI -> 去 SOI -> 去前一年 -> 仅 ONI）。"""
+    pool = get_pool(oni, soi, scsmi, dmi)
     deg_chain = [
         ("全特征", POS_AXES),
-        ("无SOI", [ax for ax in POS_AXES if ax[0] != "soi"]),
-        ("无前一年", [ax for ax in POS_AXES if ax[0] != "prev"]),
+        ("无DMI", [ax for ax in POS_AXES if ax[0] != "dmi"]),
+        ("无SOI", [ax for ax in POS_AXES if ax[0] not in ("soi", "dmi")]),
+        ("无前一年", [ax for ax in POS_AXES if ax[0] not in ("prev", "dmi")]),
         ("仅ONI", [ax for ax in POS_AXES if ax[0] == "oni"]),
     ]
     last_res = None
@@ -1112,9 +1196,9 @@ def analog_distribution(oni, soi, scsmi, y_t, m,
 
 # ------------------------------------------------------ 分层收缩与组合 ----
 
-def monthly_analog(oni, soi, scsmi, y_t, m, min_candidates=MIN_CANDIDATES):
+def monthly_analog(oni, soi, scsmi, y_t, m, min_candidates=MIN_CANDIDATES, dmi=None):
     """相似型的同相（同窗口结束月）版本。"""
-    pool = get_pool(oni, soi, scsmi)
+    pool = get_pool(oni, soi, scsmi, dmi)
     _, w0 = mon_norm(y_t - (1 if m >= 6 else 0), m - 1)
     res = _analog_core_pool(pool, y_t, m, phase=w0, axes=POS_AXES,
                             min_candidates=min_candidates, bw_floor=BW_FLOOR)
@@ -1124,12 +1208,13 @@ def monthly_analog(oni, soi, scsmi, y_t, m, min_candidates=MIN_CANDIDATES):
     return res, res["n_cand"], n_all
 
 
-def shrunk_components(oni, soi, scsmi, y_t, m, prior=PRIOR_STRENGTH, k_shrink=SHRINK_K):
+def shrunk_components(oni, soi, scsmi, y_t, m, prior=PRIOR_STRENGTH, k_shrink=SHRINK_K,
+                      dmi=None):
     """经验贝叶斯收缩后的两个模型组件与混合参数。"""
     t_pool = transition_distribution(oni, soi, scsmi, y_t, m, prior, phase=None)
     t_m, n_tm = monthly_transition(oni, soi, scsmi, y_t, m, prior)
-    a_pool = analog_distribution(oni, soi, scsmi, y_t, m, phase=None)
-    a_m_res, n_am, _ = monthly_analog(oni, soi, scsmi, y_t, m)
+    a_pool = analog_distribution(oni, soi, scsmi, y_t, m, phase=None, dmi=dmi)
+    a_m_res, n_am, _ = monthly_analog(oni, soi, scsmi, y_t, m, dmi=dmi)
 
     n_tpool = t_pool.get("n", 0)
     lam_t = n_tm / (n_tm + k_shrink) if n_tm > 0 else 0.0
@@ -1213,7 +1298,7 @@ def blend_forecast(p_t, p_a, w_t, alpha_t, alpha_a, seed=MC_SEED, draws=MC_DRAWS
 
 # ------------------------------------------------------------ 回测 ----
 
-def compute_skills(oni, soi, scsmi, verify_years=None, verbose=False):
+def compute_skills(oni, soi, scsmi, verify_years=None, verbose=False, dmi=None):
     """对每个起报月 m 做样本外回测：
     返回 dict: {m: {n, bs_model_t, bs_model_a, bs_blend, bs_clim,
                     skill_t, skill_a, skill_blend, w_t, flag}}"""
@@ -1226,10 +1311,10 @@ def compute_skills(oni, soi, scsmi, verify_years=None, verbose=False):
             t_pool = transition_distribution(oni, soi, scsmi, y, m)
             if t_pool is None or t_pool.get("p") is None:
                 continue
-            a_pool = analog_distribution(oni, soi, scsmi, y, m)
+            a_pool = analog_distribution(oni, soi, scsmi, y, m, dmi=dmi)
             if a_pool is None or a_pool.get("degraded"):
                 continue  # 两模型都必须给出非降级估计才计入技能比较
-            comp = shrunk_components(oni, soi, scsmi, y, m)
+            comp = shrunk_components(oni, soi, scsmi, y, m, dmi=dmi)
             s_obs = state_of(jjas_norm(scsmi, y))
             entries.append((y, comp["p_trans"], comp["p_analog"], s_obs))
         if not entries:
@@ -1268,19 +1353,19 @@ def compute_skills(oni, soi, scsmi, verify_years=None, verbose=False):
     return skills
 
 
-def compute_calibration(oni, soi, scsmi, verify_years=None):
+def compute_calibration(oni, soi, scsmi, verify_years=None, dmi=None):
     """可靠性校准：把历史（m × y）组合概率分 10 桶，每状态一条曲线。"""
     ys = verify_years if verify_years is not None else target_years(scsmi)
     ys = [y for y in ys if y >= VERIFY_START and jjas_norm(scsmi, y - 1) is not None]
     buckets = defaultdict(lambda: defaultdict(lambda: [0.0, 0.0, 0.0]))  # s -> bin -> [Σp, count, hits]
     # 需要组合权重：用全部验证年预先算一遍全局技能 -> 权重
-    skills = compute_skills(oni, soi, scsmi, ys)
+    skills = compute_skills(oni, soi, scsmi, ys, dmi=dmi)
     for m in range(1, 13):
         w_t = skills[m].get("w_t")
         if w_t is None:
             continue
         for y in ys:
-            comp = shrunk_components(oni, soi, scsmi, y, m)
+            comp = shrunk_components(oni, soi, scsmi, y, m, dmi=dmi)
             if comp["p_analog"] is None:
                 continue
             p_blend = {s: w_t * comp["p_trans"][s] + (1 - w_t) * comp["p_analog"][s]
@@ -1440,7 +1525,7 @@ def strong_month_dist(am, scsmi):
     return [d / tw for d in dist]
 
 
-def compute_monthly_calibration(oni, soi, scsmi, verify_years=None):
+def compute_monthly_calibration(oni, soi, scsmi, verify_years=None, dmi=None):
     """逐月（6/7/8/9）校准：全部起报月合并的三分类逐月 Brier 技能 + 10 桶命中率。
     与 JJAS 校准同一无泄漏口径（历史预测只用起报时点之前的数据）。"""
     ys = verify_years if verify_years is not None else target_years(scsmi)
@@ -1453,7 +1538,7 @@ def compute_monthly_calibration(oni, soi, scsmi, verify_years=None):
     } for _ in range(4)]
     for m in range(1, 13):
         for y in ys:
-            comp = shrunk_components(oni, soi, scsmi, y, m)
+            comp = shrunk_components(oni, soi, scsmi, y, m, dmi=dmi)
             am = comp.get("analog_monthly") or comp.get("analog_pooled")
             if am is None:
                 continue
@@ -1535,19 +1620,19 @@ def _layer_stats(entries):
             "n_total": len(with_prev), "n_no_prev": len(entries) - len(with_prev)}
 
 
-def transition_diagnostics(oni, soi, scsmi, verify_years=None):
+def transition_diagnostics(oni, soi, scsmi, verify_years=None, dmi=None):
     """转折诊断：把历史回测样本按"前一年状态==当年状态（持续）/!=(转折)"分层，
     统计各层组合模型的 Brier 分与技能。分层只用前一年状态——起报时已知，不涉未来。"""
     ys = verify_years if verify_years is not None else target_years(scsmi)
     ys = [y for y in ys if y >= VERIFY_START and jjas_norm(scsmi, y - 1) is not None]
-    skills = compute_skills(oni, soi, scsmi, ys)
+    skills = compute_skills(oni, soi, scsmi, ys, dmi=dmi)
     entries = []
     for m in range(1, 13):
         w_t = skills[m].get("w_t")
         if w_t is None:
             continue
         for y in ys:
-            comp = shrunk_components(oni, soi, scsmi, y, m)
+            comp = shrunk_components(oni, soi, scsmi, y, m, dmi=dmi)
             if comp["p_analog"] is None:
                 continue
             s_prev = state_of(jjas_norm(scsmi, y - 1))
@@ -1581,6 +1666,120 @@ def print_transition_diagnostics(diag):
     print("=" * 78)
 
 
+# -------------------------------------------------------- 因子分层与年代际 ----
+
+def enso_phase_diagnostics(oni, soi, scsmi, dmi=None, verify_years=None):
+    """因子分层：把回测样本按起报时点 ENSO 发展阶段（发展/峰值/衰减/中性）分层，
+    统计各层组合 Brier 技能。阶段用起报月（含）之前的数据判定，无未来泄漏。"""
+    ys = verify_years if verify_years is not None else target_years(scsmi)
+    ys = [y for y in ys if y >= VERIFY_START and jjas_norm(scsmi, y - 1) is not None]
+    skills = compute_skills(oni, soi, scsmi, ys, dmi=dmi)
+    entries = []
+    for m in range(1, 13):
+        w_t = skills[m].get("w_t")
+        if w_t is None:
+            continue
+        for y in ys:
+            ph = enso_phase_at(oni, y if m <= 5 else y - 1, m)
+            if ph is None:
+                continue
+            comp = shrunk_components(oni, soi, scsmi, y, m, dmi=dmi)
+            if comp["p_analog"] is None:
+                continue
+            s_obs = state_of(jjas_norm(scsmi, y))
+            if s_obs is None:
+                continue
+            p_blend = {s: w_t * comp["p_trans"][s] + (1 - w_t) * comp["p_analog"][s]
+                       for s in STATES}
+            entries.append((p_blend, ph, s_obs))
+    return _phase_layer_stats(entries)
+
+
+def _phase_layer_stats(entries):
+    """entries=[(p_blend, phase, s_obs)]，按 ENSO 发展阶段分层统计 Brier 分与技能。"""
+    def stat(sub):
+        n = len(sub)
+        if n < 5:
+            return None
+        freqs = defaultdict(int)
+        for _, _, so in sub:
+            freqs[so] += 1
+        clim = {s: freqs.get(s, 0) / n for s in STATES}
+        sse_m = sum(sum((p.get(s, 0.0) - (1.0 if s == so else 0.0)) ** 2
+                        for s in STATES) / 3.0 for p, _, so in sub)
+        sse_c = sum(sum((clim[s] - (1.0 if s == so else 0.0)) ** 2
+                        for s in STATES) / 3.0 for _, _, so in sub)
+        bs_m, bs_c = sse_m / n, sse_c / n
+        skill = 1.0 - bs_m / bs_c if bs_c > 0 else None
+        return {"n": n, "bs": bs_m, "bs_clim": bs_c, "skill": skill,
+                "freq": {s: clim[s] for s in STATES}}
+    layers = {}
+    for key, _label in ENSO_PHASES:
+        layers[key] = stat([(p, ph, so) for p, ph, so in entries if ph == key])
+    return {"layers": layers, "n_total": len(entries)}
+
+
+def print_enso_phase_diagnostics(diag):
+    """终端输出：ENSO 发展阶段分层技能面板。"""
+    print("=" * 78)
+    print("因子分层诊断：起报时 ENSO 发展阶段（发展/峰值/衰减/中性）的组合 Brier 技能")
+    print("  有效分层样本  n=%d（阶段判定只用起报月及之前 ONI，无未来泄漏）" % diag["n_total"])
+    for key, label in ENSO_PHASES:
+        st = diag["layers"].get(key)
+        if st is None:
+            print("  %-8s 样本不足（<5），未统计" % label)
+            continue
+        sk = st["skill"]
+        sk_s = f"{sk:+.3f}" if sk is not None else "  n/a "
+        freq = " / ".join(f"{s}={st['freq'][s]:.0%}" for s in STATES)
+        print("  %-8s n=%3d  Brier=%.4f（气候态 %.4f）  技能分 %s   频率 %s"
+              % (label, st["n"], st["bs"], st["bs_clim"], sk_s, freq))
+    print("  解读：不同 ENSO 阶段可预报性差异大（如衰减年可预报性高、发展年低），"
+          "跨层合并会掩盖信号。")
+    print("=" * 78)
+
+
+def decadal_skill_windows(oni, soi, scsmi, dmi=None, length=30, step=5):
+    """年代际非平稳检验：30 年滚动窗（5 年步长）的组合 Brier 技能。
+    返回 [{start, end, n, skill}]，skill 为该窗各起报月组合技能均值。"""
+    ys = [y for y in target_years(scsmi)
+          if y >= VERIFY_START and jjas_norm(scsmi, y - 1) is not None]
+    if len(ys) < length:
+        return []
+    first, last = ys[0], ys[-1]
+    starts = list(range(first, last - length + 2, step))
+    if not starts or starts[-1] < last - length + 1:
+        starts.append(last - length + 1)
+    out = []
+    for s in starts:
+        win = [y for y in ys if s <= y <= s + length - 1]
+        if len(win) < max(10, length // 2):
+            continue
+        skills = compute_skills(oni, soi, scsmi, win, dmi=dmi)
+        vals = [skills[m]["skill_blend"] for m in range(1, 13)
+                if skills[m].get("skill_blend") is not None]
+        out.append({"start": s, "end": s + length - 1, "n": len(win),
+                    "skill": (sum(vals) / len(vals)) if vals else None})
+    return out
+
+
+def print_decadal_skill_windows(wins):
+    """终端输出：年代际滚动窗技能对照。"""
+    print("=" * 78)
+    print("年代际非平稳检验：30 年滚动窗（5 年步长）组合 Brier 技能")
+    print("  窗宽 30 年，每窗取 12 个起报月组合技能均值；绿=有技能，红=负技能。")
+    for w in wins:
+        sk = w["skill"]
+        sks = "%+.3f" % sk if sk is not None else "  n/a"
+        marker = "+" if (sk or 0) > 0 else "-"
+        print("  %d-%d  n=%2d  组合技能 %s %s" % (w["start"], w["end"], w["n"], sks, marker))
+    has = [w for w in wins if w["skill"] is not None]
+    if has:
+        print("  解读：窗间技能若正负摆动明显，说明可预报性存在年代际非平稳，"
+              "整体平均技能会掩盖窗口差异。")
+    print("=" * 78)
+
+
 # ------------------------------------------------------------ 在线预测 ----
 
 def live_context(today=None):
@@ -1596,14 +1795,15 @@ def run_forecast(allow_network=True, today=None, json_out=None):
     oni = load_oni(allow_network)
     soi = load_soi(allow_network)
     scsmi = load_scsmi(allow_network)
+    dmi = load_dmi(allow_network)
     y_t, m = live_context(today)
-    comp = shrunk_components(oni, soi, scsmi, y_t, m)
+    comp = shrunk_components(oni, soi, scsmi, y_t, m, dmi=dmi)
     u850 = load_u850(allow_network)
-    onset = build_onset_result(oni, soi, scsmi, u850, y_t, comp)
+    onset = build_onset_result(oni, soi, scsmi, u850, y_t, comp, dmi=dmi)
 
     ys = target_years(scsmi)
     last_target = ys[-1] if ys else None
-    skills = compute_skills(oni, soi, scsmi, ys)
+    skills = compute_skills(oni, soi, scsmi, ys, dmi=dmi)
     sk = skills.get(m, {})
     w_t = sk.get("w_t")
     if w_t is None:
@@ -1635,6 +1835,8 @@ def run_forecast(allow_network=True, today=None, json_out=None):
         "analogs": analogs, "point_forecast": pf, "strong_month_dist": smd,
         "onset": onset,
         "oni_latest": latest_oni(oni), "soi_latest": latest_soi(soi),
+        "dmi_latest": latest_dmi(dmi),
+        "enso_phase": enso_phase_at(oni, y_t if m <= 5 else y_t - 1, m),
         "oni_state_desc": describe_oni_state(oni, y_t if m <= 5 else y_t - 1, m),
         "last_scsmi_year": last_target,
         "prev_scsmi": jjas_norm(scsmi, y_t - 1),
@@ -1719,7 +1921,12 @@ def print_forecast(res):
     if res["soi_latest"]:
         sm = res["soi_latest"]
         print("最新 SOI  %+.1f（%04d-%02d）" % (sm[1], sm[0][0], sm[0][1]))
+    if res.get("dmi_latest"):
+        dm = res["dmi_latest"]
+        print("最新 DMI  %+.2f（%04d-%02d）" % (dm[1], dm[0][0], dm[0][1]))
     print("ENSO 态   %s" % res["oni_state_desc"])
+    if res.get("enso_phase"):
+        print("ENSO 阶段  %s" % dict(ENSO_PHASES).get(res["enso_phase"], res["enso_phase"]))
     pv = res["prev_scsmi"]
     print("前一年    若可得: SCSMI %s -> %s" % (
         ("%+.2f" % pv) if pv is not None else "未更新",
@@ -2051,10 +2258,12 @@ svg{max-width:100%;display:block;margin:0 auto}
 """
 
 
-def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdiag=None):
+def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdiag=None,
+                      pdiag=None, dwin=None):
     y_t = res["target_year"]
     m = res["issue_month"]
     oni_l, soi_l = res["oni_latest"], res["soi_latest"]
+    dmi_l = res.get("dmi_latest")
     now_s = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     def esc(v):
@@ -2187,6 +2396,56 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdi
             '若转折年技能显著低于持续年，说明模型在状态跳跃时存在滞后失效，'
             '转折年的概率应比持续年更谨慎解读。</p></div>' % rows_td)
 
+    pdiag_card = ""
+    if pdiag:
+        rows_pd = ""
+        for key, label in ENSO_PHASES:
+            st = pdiag["layers"].get(key)
+            if st is None:
+                rows_pd += '<tr><td>%s</td><td colspan="5">样本不足（&lt;5）</td></tr>' % label
+                continue
+            sk = st["skill"]
+            sk_s = ("%+.3f" % sk) if sk is not None else "n/a"
+            rows_pd += ('<tr><td>%s</td><td>%d</td><td>%.4f</td><td>%.4f</td><td>%s</td>'
+                        '<td>%d%% / %d%% / %d%%</td></tr>' % (
+                            label, st["n"], st["bs"], st["bs_clim"], sk_s,
+                            round(100 * st["freq"][STATE_STRONG]),
+                            round(100 * st["freq"][STATE_NORMAL]),
+                            round(100 * st["freq"][STATE_WEAK])))
+        pdiag_card = (
+            '<div class="card"><h2>因子分层：起报时 ENSO 发展阶段</h2>'
+            '<table><thead><tr><th>起报时阶段</th><th>样本</th><th>组合 Brier</th>'
+            '<th>气候态 Brier</th><th>Brier 技能</th><th>实际频率 强/正常/弱</th>'
+            '</tr></thead><tbody>%s</tbody></table>'
+            '<p class="note">发展阶段由起报月（含）之前的 3 个月 ONI 趋势判定'
+            '（变化 ≥ +0.2 为发展、≤ -0.2 为衰减、平缓为峰值，近 6 个月 |ONI| 全 &lt;0.5 为中性），'
+            '只用起报时已知数据，无未来泄漏。跨阶段可预报性差异越大，'
+            '说明按阶段分层解读越有必要。</p></div>' % rows_pd)
+
+    dwin_card = ""
+    if dwin:
+        bars = ""
+        mx = max((abs(w["skill"]) for w in dwin if w["skill"] is not None),
+                 default=0.01) or 0.01
+        for w in dwin:
+            sk = w["skill"]
+            pct = 0 if sk is None else abs(sk) / mx * 100
+            cls = "bar-pos" if (sk or 0) >= 0 else "bar-neg"
+            bars += ('<div class="drow"><span class="dlab">%d-%d</span>'
+                     '<div class="dbar"><div class="dfill %s" style="width:%.1f%%"></div></div>'
+                     '<span class="dval">%s</span></div>' % (
+                         w["start"], w["end"], cls, pct,
+                         ("%+.3f" % sk) if sk is not None else "n/a"))
+        dwin_card = (
+            '<div class="card"><h2>年代际非平稳检验：30 年滚动窗组合技能</h2>'
+            '<p class="note">窗宽 30 年、5 年步长，每窗取 12 个起报月组合 Brier 技能均值。'
+            '绿=正技能，红=负技能。窗间摆动越大，说明季风可预报性越存在年代际非平稳，'
+            '整体平均技能会掩盖窗口差异。</p>%s'
+            '<style>.drow{display:flex;align-items:center;margin:2px 0}'
+            '.dlab{width:76px;font-size:11px;color:#888}.dbar{flex:1;background:#222;height:10px;margin:0 8px}'
+            '.dfill{height:10px}.bar-pos{background:#2e9e5b}.bar-neg{background:#c0392b}'
+            '.dval{width:52px;text-align:right;font-size:11px}</style></div>' % bars)
+
     skt = res.get("skill_trans")
     ska = res.get("skill_analog")
     skb = res.get("skill_blend")
@@ -2199,6 +2458,12 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdi
     soi_s = "NA"
     if soi_l:
         soi_s = "%+.1f（%04d-%02d）" % (soi_l[1], soi_l[0][0], soi_l[0][1])
+    dmi_s = "NA"
+    if dmi_l:
+        dmi_s = "%+.2f（%04d-%02d）" % (dmi_l[1], dmi_l[0][0], dmi_l[0][1])
+    ph_s = "未知"
+    if res.get("enso_phase"):
+        ph_s = dict(ENSO_PHASES).get(res["enso_phase"], res["enso_phase"])
     py = res["target_years_full"]
     first_yr, last_yr = (py[0], py[-1]) if py else (1948, 1948)
 
@@ -2273,9 +2538,11 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdi
 <div class="card">
 <h2>当前气候背景</h2>
 <table>
-<thead><tr><th>最新 ONI</th><th>最新 SOI</th><th>ENSO 状态</th><th>前一年 SCSMI</th><th>前一年状态</th></tr></thead>
-<tbody><tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr></tbody>
+<thead><tr><th>最新 ONI</th><th>最新 SOI</th><th>最新 DMI</th><th>ENSO 状态</th>
+<th>起报时 ENSO 阶段</th><th>前一年 SCSMI</th><th>前一年状态</th></tr></thead>
+<tbody><tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr></tbody>
 </table>
+<p class="note">ENSO 发展阶段（发展/峰值/衰减/中性）由起报月及之前 3 个月 ONI 趋势判定，只反映起报时已知信息。</p>
 </div>
 <div class="card">
 <h2>%d 年夏季（6-9 月）季风状态概率</h2>
@@ -2286,7 +2553,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdi
 <div class="card">
 <h2>最相似的历史年份（其后夏季实际走势）</h2>
 %s
-<p class="note">距离为标准化后的 13 维特征欧氏距离；权重为高斯核权重。相似年只取自目标年之前的年份，无未来信息。</p>
+<p class="note">距离为标准化后的多维特征（ONI/SOI/DMI 轨迹 + 前一年 SCSMI）欧氏距离；权重为高斯核权重。相似年只取自目标年之前的年份，无未来信息。</p>
 </div>
 <div class="card">
 <h2>夏季逐月强度点预测（相似型加权 + 90%% 区间）</h2>
@@ -2313,6 +2580,8 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdi
 校准样本为全部起报月×验证年的组合预测（同一年会被多次计样本）。</p>
 </div>
 %s
+%s
+%s
 <div class="card">
 <h2>方法与数据</h2>
 <p class="note">
@@ -2320,9 +2589,9 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdi
 度量南海季风区低层环流季节性反转的强度，是中国东南部夏季风（东南季风）的直接强度指标；
 偏强年对应华南-东南沿海夏季水汽输送总体偏强、降水易偏多（后汛期尤其明显），但指数与区域降水的相关并非 1:1，<b>不能把它当作降水预报直接使用</b>。<br>
 <b>阈值：</b>JJAS 标准化值 ≥ +0.5σ 记为偏强，≤ -0.5σ 记为偏弱，其余为正常。<br>
-<b>预报因子：</b>起报前 6 个月 ONI 轨迹与 SOI 轨迹（NOAA CPC 逐月更新）+ 前一年 SCSMI（季风自身持续性）。<br>
+<b>预报因子：</b>起报前 6 个月 ONI 轨迹、SOI 轨迹与印度洋偶极子 DMI 轨迹（NOAA CPC/PSL 逐月更新）+ 前一年 SCSMI（季风自身持续性）。<br>
 <b>状态转移模型：</b>P(今夏状态 | 去夏状态, 起报时 ENSO 态)，条件计数 + Dirichlet 先验（强度 4×边际频率）。<br>
-<b>历史相似型：</b>13 维特征滚动标准化欧氏距离 + 高斯核加权（Silverman 带宽，下限 0.35）；
+<b>历史相似型：</b>多维特征（6 月 ONI + 6 月 SOI + 6 月 DMI 轨迹 + 前一年 SCSMI）滚动标准化欧氏距离 + 高斯核加权（Silverman 带宽，下限 0.35）；
 候选年全部早于目标年，滚动标准化只使用候选年统计量，无未来泄漏。<br>
 <b>收缩与组合：</b>起报月分层（同月样本）与全历史估计按 λ = n/(n+24) 经验贝叶斯收缩；
 组合权重按样本外三分类 Brier 技能分分配，负技能剔除，双负等权。<br>
@@ -2334,6 +2603,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdi
 <span class="tag">SCSMI <a href="http://lijianping.cn/dct/page/65578">lijianping.cn</a></span>
 <span class="tag">ONI <a href="https://www.cpc.ncep.noaa.gov/data/indices/oni.ascii.txt">NOAA CPC</a></span>
 <span class="tag">SOI <a href="https://www.cpc.ncep.noaa.gov/data/indices/soi">NOAA CPC</a></span>
+<span class="tag">DMI <a href="https://psl.noaa.gov/gcos_wgsp/Timeseries/DMI/">NOAA PSL</a></span>
 </p>
 </div>
 <div class="card">
@@ -2355,7 +2625,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdi
         y_t, _REPORT_CSS, now_s,
         y_t if m <= 5 else y_t - 1, MONTH_CN[m], y_t, res["lead"],
         warn,
-        esc(oni_s), esc(soi_s), esc(res["oni_state_desc"]),
+        esc(oni_s), esc(soi_s), esc(dmi_s), esc(res["oni_state_desc"]), esc(ph_s),
         esc(("%+.2f" % res["prev_scsmi"]) if res["prev_scsmi"] is not None else "未更新"),
         esc(res["prev_state"] or "未知"),
         y_t, cards_html,
@@ -2363,7 +2633,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdi
         res["n_verify"] if res["n_verify"] is not None else 0,
         analog_table, pf_html, mon_card,
         first_yr, last_yr, hist_html, onset_card, heat_html, rel_html,
-        tdiag_card,
+        tdiag_card, pdiag_card, dwin_card,
         res["data_end_year"],
         len(res["target_years_full"]), first_yr, last_yr,
     )
@@ -2819,6 +3089,96 @@ def run_selftest(verbose=True):
            (_t_pd is None or _t_pd["n"] >= 5) and (_t_tr is None or _t_tr["n"] >= 5) and
            (_t_pd is None or _t_tr is None or _t_pd["n"] + _t_tr["n"] == _td["n_total"]), "")
 
+    # ---- DMI 解析与特征集成 ----
+    _dmi_txt = (" 1870 2026\n"
+                "1870  -0.10  -0.20  -0.30  -0.40  -0.50  -0.60  -0.70  -0.80  -0.90"
+                "  -1.00  -1.10  -1.20\n"
+                "1997   0.10 -9999.000   0.30   0.40   0.50   0.60   0.70   0.80"
+                "   0.90   1.00   1.10   1.20\n"
+                "Timeseries output created at NOAA PSL\nhttps://psl.noaa.gov/gcos_wgsp/timeseries/DMI\n")
+    _pd = parse_dmi(_dmi_txt)
+    _check("DMI解析-年行与值", _close(_pd.get((1870, 1)), -0.10, 1e-9) and
+           _close(_pd.get((1870, 12)), -1.20, 1e-9) and _close(_pd.get((1997, 1)), 0.10, 1e-9), "")
+    _check("DMI解析-缺失", _pd.get((1997, 2)) is None and _close(_pd.get((1997, 3)), 0.30, 1e-9), "")
+    _check("DMI解析-页脚表头忽略", (2026, 1) not in _pd and (1870, 13) not in _pd, "")
+    _dl = load_dmi(allow_network=False)
+    if _dl:
+        _check("DMI真实缓存-覆盖", len(_dl) > 1500 and
+               any(y >= 2020 and v is not None for (y, _m), v in _dl.items()), "")
+    else:
+        print("  提示：暂无 DMI 本地缓存（运行 update 后自动补齐），DMI 真实缓存测试跳过")
+    _dmi_zero = {(y, m): 0.0 for y in range(1950, 2027) for m in range(1, 13)}
+    _ax19 = build_feature_axes(2020, 4)
+    _check("DMI因子-轴数", len(POS_AXES) == 19 and
+           len([a for a in _ax19 if a[0] == "dmi"]) == 6 and len(_ax19) == 19, "")
+    _vq = feature_vector(_ax19, oni, soi, scsmi, 2020, dmi=_dmi_zero)
+    _check("DMI因子-向量取值", all(v == 0.0 for ax, v in _vq.items() if ax[0] == "dmi") and
+           _vq[("prev", 2019)] == jjas_norm(scsmi, 2019), "")
+    _check("DMI因子-缺失降级", axis_value(("dmi", 2000, 1), oni, soi, scsmi, 2020) is None, "")
+    _p_no_d = analog_distribution(oni, soi, scsmi, 2020, 4)
+    _p_no_d2 = analog_distribution(oni, soi, scsmi, 2020, 4, dmi=None)
+    _p_z_d = analog_distribution(oni, soi, scsmi, 2020, 4, dmi=_dmi_zero)
+    _check("DMI因子-无DMI等价", bool(_p_no_d) and bool(_p_no_d2) and
+           _p_no_d["p"] == _p_no_d2["p"] and _p_no_d["n_cand"] == _p_no_d2["n_cand"], "")
+    _check("DMI因子-零常数候选守恒与分布合法", bool(_p_z_d) and
+           abs(_p_z_d["n_cand"] - _p_no_d["n_cand"]) <= 5 and
+           _close(sum(_p_z_d["p"].values()), 1.0, 1e-12) and
+           all(0.0 <= _p_z_d["p"][s] <= 1.0 for s in STATES), "")
+
+    # ---- ENSO 发展阶段判定（纯函数） ----
+    def _mk_oni(seq):
+        d = {}
+        yr, mo = 1990, 1
+        for v in seq:
+            d[(yr, mo)] = v
+            mo += 1
+            if mo > 12:
+                mo = 1
+                yr += 1
+        return d
+    _check("ENSO阶段-发展", enso_phase_at(
+        _mk_oni([0.1, 0.1, 0.2, 0.1, 0.2, 0.1, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4]), 1990, 12) == "D", "")
+    _check("ENSO阶段-衰减", enso_phase_at(
+        _mk_oni([1.3, 1.1, 0.9, 0.7, 0.5, 0.3, -0.1, -0.3, -0.5, -0.7, -0.9, -1.1]), 1990, 12) == "C", "")
+    _check("ENSO阶段-峰值", enso_phase_at(
+        _mk_oni([0.8, 0.9, 1.0, 1.0, 0.95, 1.0, 1.0, 1.05, 1.0, 1.05, 1.0, 1.0]), 1990, 12) == "P", "")
+    _check("ENSO阶段-中性", enso_phase_at(
+        _mk_oni([0.2, 0.1, -0.2, 0.1, 0.0, 0.1, -0.1, -0.2, 0.0, 0.1, -0.1, 0.0]), 1990, 12) == "N", "")
+    _check("ENSO阶段-数据不足", enso_phase_at({(1990, 1): 1.0}, 1990, 3) is None, "")
+
+    # ---- ENSO 阶段分层层统计 ----
+    _perf2 = [({s: (1.0 if s == si else 0.0) for s in STATES}, "D", si)
+              for si in [STATE_STRONG] * 3 + [STATE_NORMAL] * 3 + [STATE_WEAK] * 3]
+    _ls2 = _phase_layer_stats(_perf2)
+    _check("阶段层统计-确定性手算", _ls2["n_total"] == 9 and _ls2["layers"]["D"]["n"] == 9 and
+           _close(_ls2["layers"]["D"]["bs"], 0.0, 1e-9) and
+           _ls2["layers"]["D"]["skill"] is not None, "")
+    _check("阶段层统计-其余层为空", all(_ls2["layers"][k] is None for k in ("P", "C", "N")), "")
+    _check("阶段层统计-空输入安全", _phase_layer_stats([])["n_total"] == 0 and
+           all(v is None for v in _phase_layer_stats([])["layers"].values()), "")
+    _ph = enso_phase_diagnostics(oni, soi, scsmi, dmi=_dl or _dmi_zero,
+                                 verify_years=list(range(1990, 1996)))
+    _check("阶段分层诊断-结构", isinstance(_ph, dict) and "layers" in _ph and
+           _ph["n_total"] >= 0, "")
+    _check("阶段分层诊断-分层守恒", sum(st["n"] for st in _ph["layers"].values() if st) <=
+           _ph["n_total"], "")
+    _check("阶段分层诊断-小样本层为None", all(st is None or st["n"] >= 5
+                                               for st in _ph["layers"].values()), "")
+    _check("阶段分层诊断-技能上限", all(st["skill"] is None or st["skill"] <= 1.0 + 1e-9
+                                         for st in _ph["layers"].values() if st), "")
+
+    # ---- 年代际滚动窗（合成序列 + 真实因子，控时长） ----
+    _rows = _synthetic_monsoon()
+    _scsmi_sub = {y: v for y, v in _rows.items() if 1961 <= y <= 2020}
+    _wins = decadal_skill_windows(oni, soi, _scsmi_sub, dmi=_dmi_zero, length=20, step=10)
+    _check("年代际窗-数量", 3 <= len(_wins) <= 6, "应生成若干滚动窗")
+    _check("年代际窗-窗长与样本", all(w["end"] - w["start"] + 1 == 20 and w["n"] == 20
+                                       for w in _wins), "")
+    _check("年代际窗-排序递增", all(_wins[i]["start"] < _wins[i + 1]["start"]
+                                     for i in range(len(_wins) - 1)), "")
+    _check("年代际窗-技能上限", all(w["skill"] is None or w["skill"] <= 1.0 + 1e-9
+                                     for w in _wins), "")
+
     # ---- 完整报告 ----
     res, _ = run_forecast(allow_network=False, today=datetime.date(2026, 3, 15))
     report = build_report_html(res, compute_skills(oni, soi, scsmi), calib, scsmi, False)
@@ -2885,13 +3245,14 @@ def main():
         oni = load_oni(allow_network)
         soi = load_soi(allow_network)
         scsmi = load_scsmi(allow_network)
-        skills = compute_skills(oni, soi, scsmi)
+        dmi = load_dmi(allow_network)
+        skills = compute_skills(oni, soi, scsmi, dmi=dmi)
         print_backtest(skills)
         u850 = load_u850(allow_network)
         seq = onset_series(u850)
         if len(seq) >= 25:
             st = onset_stats(seq)
-            cv = onset_cross_validate(oni, soi, scsmi, seq)
+            cv = onset_cross_validate(oni, soi, scsmi, seq, dmi=dmi)
             print("=" * 92)
             print("南海季风爆发日期：样本外验证（%d-%d，共 %d 年序列，均值 %s）" % (
                 cv["verify_start"], st["last_year"], st["n"], pentad_label(st["mean"])))
@@ -2906,19 +3267,25 @@ def main():
                     d["mae"], d["mae_clim"], 100 * d["skill"], 100 * d["hit_rate"]))
         else:
             print("南海季风爆发日期序列不足（缺 U850 缓存），跳过。请先运行 update。")
-        print_transition_diagnostics(transition_diagnostics(oni, soi, scsmi))
+        print_transition_diagnostics(transition_diagnostics(oni, soi, scsmi, dmi=dmi))
+        print_enso_phase_diagnostics(enso_phase_diagnostics(oni, soi, scsmi, dmi=dmi))
+        print_decadal_skill_windows(decadal_skill_windows(oni, soi, scsmi, dmi=dmi))
         return 0
     if args.command == "report":
         oni = load_oni(allow_network)
         soi = load_soi(allow_network)
         scsmi = load_scsmi(allow_network)
+        dmi = load_dmi(allow_network)
         res, _ = run_forecast(allow_network=allow_network)
         ys = target_years(scsmi)
-        skills = compute_skills(oni, soi, scsmi, ys)
-        calib = compute_calibration(oni, soi, scsmi, ys)
-        mcalib = compute_monthly_calibration(oni, soi, scsmi, ys)
-        tdiag = transition_diagnostics(oni, soi, scsmi, ys)
-        report = build_report_html(res, skills, calib, scsmi, allow_network, mcalib, tdiag)
+        skills = compute_skills(oni, soi, scsmi, ys, dmi=dmi)
+        calib = compute_calibration(oni, soi, scsmi, ys, dmi=dmi)
+        mcalib = compute_monthly_calibration(oni, soi, scsmi, ys, dmi=dmi)
+        tdiag = transition_diagnostics(oni, soi, scsmi, ys, dmi=dmi)
+        pdiag = enso_phase_diagnostics(oni, soi, scsmi, dmi=dmi, verify_years=ys)
+        dwin = decadal_skill_windows(oni, soi, scsmi, dmi=dmi)
+        report = build_report_html(res, skills, calib, scsmi, allow_network, mcalib,
+                                   tdiag, pdiag, dwin)
         out_path = args.out or os.path.join(OUTPUT_DIR, "monsoon_report.html")
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
