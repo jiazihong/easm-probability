@@ -1506,6 +1506,81 @@ def compute_monthly_calibration(oni, soi, scsmi, verify_years=None):
     return out
 
 
+# ------------------------------------------------------------ 转折诊断 ----
+
+def _layer_stats(entries):
+    """转折诊断的纯统计层：entries=[(p_blend, s_prev, s_obs)]。
+    按 前一年状态==当年状态（持续）/ !=（转折）分层，各层统计组合 Brier 分与技能；
+    层样本 <5 或气候 Brier 为 0 时对应层返回 None。"""
+    def stat(sub):
+        n = len(sub)
+        if n < 5:
+            return None
+        freqs = defaultdict(int)
+        for _, _, so in sub:
+            freqs[so] += 1
+        clim = {s: freqs.get(s, 0) / n for s in STATES}
+        sse_m = sum(sum((p.get(s, 0.0) - (1.0 if s == so else 0.0)) ** 2
+                        for s in STATES) / 3.0 for p, _, so in sub)
+        sse_c = sum(sum((clim[s] - (1.0 if s == so else 0.0)) ** 2
+                        for s in STATES) / 3.0 for _, _, so in sub)
+        bs_m, bs_c = sse_m / n, sse_c / n
+        skill = 1.0 - bs_m / bs_c if bs_c > 0 else None
+        return {"n": n, "bs": bs_m, "bs_clim": bs_c, "skill": skill,
+                "freq": {s: clim[s] for s in STATES}}
+    with_prev = [e for e in entries if e[1] is not None]
+    persist = [e for e in with_prev if e[1] == e[2]]
+    transit = [e for e in with_prev if e[1] != e[2]]
+    return {"persist": stat(persist), "transition": stat(transit),
+            "n_total": len(with_prev), "n_no_prev": len(entries) - len(with_prev)}
+
+
+def transition_diagnostics(oni, soi, scsmi, verify_years=None):
+    """转折诊断：把历史回测样本按"前一年状态==当年状态（持续）/!=(转折)"分层，
+    统计各层组合模型的 Brier 分与技能。分层只用前一年状态——起报时已知，不涉未来。"""
+    ys = verify_years if verify_years is not None else target_years(scsmi)
+    ys = [y for y in ys if y >= VERIFY_START and jjas_norm(scsmi, y - 1) is not None]
+    skills = compute_skills(oni, soi, scsmi, ys)
+    entries = []
+    for m in range(1, 13):
+        w_t = skills[m].get("w_t")
+        if w_t is None:
+            continue
+        for y in ys:
+            comp = shrunk_components(oni, soi, scsmi, y, m)
+            if comp["p_analog"] is None:
+                continue
+            s_prev = state_of(jjas_norm(scsmi, y - 1))
+            s_obs = state_of(jjas_norm(scsmi, y))
+            if s_prev is None or s_obs is None:
+                continue
+            p_blend = {s: w_t * comp["p_trans"][s] + (1 - w_t) * comp["p_analog"][s]
+                       for s in STATES}
+            entries.append((p_blend, s_prev, s_obs))
+    return _layer_stats(entries)
+
+
+def print_transition_diagnostics(diag):
+    """终端输出：转折诊断面板。"""
+    print("=" * 78)
+    print("转折诊断：持续性年份 vs 转折年份 的组合模型 Brier 分与技能")
+    print(f"  有效分层样本  n={diag['n_total']}"
+          f"（缺少前一年状态被跳过 {diag['n_no_prev']} 条）")
+    for key, label in (("persist", "持续年（今年状态=去年状态）"),
+                       ("transition", "转折年（今年状态≠去年状态）")):
+        st = diag[key]
+        if st is None:
+            print(f"  {label:<18} 样本不足（<5），未统计")
+            continue
+        sk = st["skill"]
+        sk_s = f"{sk:+.3f}" if sk is not None else "  n/a "
+        freq = " / ".join(f"{s}={st['freq'][s]:.0%}" for s in STATES)
+        print(f"  {label:<18} n={st['n']:>3d}  Brier={st['bs']:.4f}"
+              f"（气候态 {st['bs_clim']:.4f}）  技能分 {sk_s}   频率 {freq}")
+    print("  解读：若转折年技能分显著低于持续年，说明模型在状态转折时滞后失效。")
+    print("=" * 78)
+
+
 # ------------------------------------------------------------ 在线预测 ----
 
 def live_context(today=None):
@@ -1976,7 +2051,7 @@ svg{max-width:100%;display:block;margin:0 auto}
 """
 
 
-def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None):
+def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None, tdiag=None):
     y_t = res["target_year"]
     m = res["issue_month"]
     oni_l, soi_l = res["oni_latest"], res["soi_latest"]
@@ -2083,6 +2158,34 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None):
                       'Dirichlet 后验蒙特卡洛 90% 区间。季节平均态会掩盖月内反向信号，'
                       '请与上方逐月强度曲线交叉解读。</p>'
                     + '</div>')
+
+    tdiag_card = ""
+    if tdiag:
+        rows_td = ""
+        for key, label in (("persist", "持续年（今年状态=去年状态）"),
+                           ("transition", "转折年（今年状态≠去年状态）")):
+            st = tdiag[key]
+            if st is None:
+                rows_td += '<tr><td>%s</td><td colspan="5">样本不足（&lt;5）</td></tr>' % label
+                continue
+            sk = st["skill"]
+            sk_s = ("%+.3f" % sk) if sk is not None else "n/a"
+            rows_td += ('<tr><td>%s</td><td>%d</td><td>%.4f</td><td>%.4f</td><td>%s</td>'
+                        '<td>%d%% / %d%% / %d%%</td></tr>' % (
+                            label, st["n"], st["bs"], st["bs_clim"], sk_s,
+                            round(100 * st["freq"][STATE_STRONG]),
+                            round(100 * st["freq"][STATE_NORMAL]),
+                            round(100 * st["freq"][STATE_WEAK])))
+        tdiag_card = (
+            '<div class="card"><h2>转折诊断：持续年 vs 转折年</h2>'
+            '<table><thead><tr><th>层</th><th>样本</th><th>组合 Brier</th>'
+            '<th>气候态 Brier</th><th>Brier 技能</th><th>实际频率 强/正常/弱</th>'
+            '</tr></thead><tbody>%s</tbody></table>'
+            '<p class="note">夏季风并非渐变：南海季风爆发本身就是一次状态"跳跃"，'
+            '季节平均态同样存在持续年与转折年之别。本表把回测样本按'
+            '"去年状态 == / != 当年实际状态"分层（分层只用前一年状态，起报时已知，无未来信息）。'
+            '若转折年技能显著低于持续年，说明模型在状态跳跃时存在滞后失效，'
+            '转折年的概率应比持续年更谨慎解读。</p></div>' % rows_td)
 
     skt = res.get("skill_trans")
     ska = res.get("skill_analog")
@@ -2209,6 +2312,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None):
 <p class="note">横轴=模型给出的预测概率（分桶平均），纵轴=该桶内实际发生频率；曲线越贴近对角线越可靠。
 校准样本为全部起报月×验证年的组合预测（同一年会被多次计样本）。</p>
 </div>
+%s
 <div class="card">
 <h2>方法与数据</h2>
 <p class="note">
@@ -2259,6 +2363,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None):
         res["n_verify"] if res["n_verify"] is not None else 0,
         analog_table, pf_html, mon_card,
         first_yr, last_yr, hist_html, onset_card, heat_html, rel_html,
+        tdiag_card,
         res["data_end_year"],
         len(res["target_years_full"]), first_yr, last_yr,
     )
@@ -2673,11 +2778,58 @@ def run_selftest(verbose=True):
     heat_html = _skill_table(skills)
     _check("热力表格-结构", heat_html.count("<tr>") >= 13 and "技能分" in heat_html, "")
 
+    # ---- 转折诊断：纯统计层 ----
+    _p_unif = {s: 1.0 / 3.0 for s in STATES}
+    _td_rnd = random.Random(42)
+    _td_entries = []
+    for _ in range(60):
+        sp = _td_rnd.choice(STATES)
+        so = sp if _td_rnd.random() < 0.7 else _td_rnd.choice([s for s in STATES if s != sp])
+        _td_entries.append((dict(_p_unif), sp, so))
+    _ls = _layer_stats(_td_entries)
+    _check("转折层统计-结构", _ls["n_total"] == 60 and _ls["n_no_prev"] == 0, "")
+    _check("转折层统计-层样本和", _ls["persist"]["n"] + _ls["transition"]["n"] == 60, "")
+    _check("转折层统计-两层均有样本", None not in (_ls["persist"], _ls["transition"]), "")
+    for _k in ("persist", "transition"):
+        _st = _ls[_k]
+        _check("转折层统计-Brier技能上限[%s]" % _k,
+               _st["skill"] is None or _st["skill"] <= 1.0 + 1e-9, "")
+        _check("转折层统计-频率归一[%s]" % _k,
+               _close(sum(_st["freq"].values()), 1.0, 1e-9), "")
+    _td_perf = [({s: (1.0 if s == si else 0.0) for s in STATES}, si, si)
+                for si in [STATE_STRONG] * 4 + [STATE_WEAK] * 4]
+    _ls_perf = _layer_stats(_td_perf)
+    _check("转折层统计-确定性手算", _ls_perf["persist"]["n"] == 8 and
+           _close(_ls_perf["persist"]["bs"], 0.0, 1e-9) and
+           (_ls_perf["persist"]["skill"] is None or
+            _close(_ls_perf["persist"]["skill"], 1.0, 1e-9)) and
+           _ls_perf["transition"] is None, "")
+    _check("转折层统计-空层安全", _layer_stats([])["persist"] is None and
+           _layer_stats([])["transition"] is None and
+           _layer_stats([])["n_total"] == 0, "")
+    _check("转折层统计-缺失前态剔除",
+           _layer_stats([(_p_unif, None, STATE_NORMAL)] * 8)["n_no_prev"] == 8 and
+           _layer_stats([(_p_unif, None, STATE_NORMAL)] * 8)["n_total"] == 0, "")
+
+    # ---- 转折诊断：真实数据小子集集成（控时，无未来泄漏） ----
+    _td = transition_diagnostics(oni, soi, scsmi, verify_years=list(range(1990, 1996)))
+    _t_pd, _t_tr = _td["persist"], _td["transition"]
+    _check("转折诊断-真实子集结构", isinstance(_td, dict) and _td["n_total"] >= 0, "")
+    _check("转折诊断-真实子集分层守恒",
+           (_t_pd is None or _t_pd["n"] >= 5) and (_t_tr is None or _t_tr["n"] >= 5) and
+           (_t_pd is None or _t_tr is None or _t_pd["n"] + _t_tr["n"] == _td["n_total"]), "")
+
     # ---- 完整报告 ----
     res, _ = run_forecast(allow_network=False, today=datetime.date(2026, 3, 15))
     report = build_report_html(res, compute_skills(oni, soi, scsmi), calib, scsmi, False)
     for kw in ("概率", "相似", "技能", "可靠性", "局限性", "SCSMI", "SVG".lower()):
         _check("报告-关键词[%s]" % kw, kw in report or kw in report.lower(), "")
+    report_td = build_report_html(res, compute_skills(oni, soi, scsmi), calib, scsmi, False,
+                                  tdiag=_td)
+    _check("报告-转折诊断卡", "转折诊断" in report_td and "持续年" in report_td and
+           "转折年" in report_td, "")
+    _check("报告-转折标签闭合", report_td.count("<html") == report_td.count("</html>") == 1 and
+           report_td.count("<body>") == report_td.count("</body>") == 1, "")
     _check("报告-标签闭合", report.count("<html") == report.count("</html>") == 1 and
            report.count("<body>") == report.count("</body>") == 1, "")
 
@@ -2754,6 +2906,7 @@ def main():
                     d["mae"], d["mae_clim"], 100 * d["skill"], 100 * d["hit_rate"]))
         else:
             print("南海季风爆发日期序列不足（缺 U850 缓存），跳过。请先运行 update。")
+        print_transition_diagnostics(transition_diagnostics(oni, soi, scsmi))
         return 0
     if args.command == "report":
         oni = load_oni(allow_network)
@@ -2764,7 +2917,8 @@ def main():
         skills = compute_skills(oni, soi, scsmi, ys)
         calib = compute_calibration(oni, soi, scsmi, ys)
         mcalib = compute_monthly_calibration(oni, soi, scsmi, ys)
-        report = build_report_html(res, skills, calib, scsmi, allow_network, mcalib)
+        tdiag = transition_diagnostics(oni, soi, scsmi, ys)
+        report = build_report_html(res, skills, calib, scsmi, allow_network, mcalib, tdiag)
         out_path = args.out or os.path.join(OUTPUT_DIR, "monsoon_report.html")
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
