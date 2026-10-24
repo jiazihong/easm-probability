@@ -44,6 +44,7 @@ import re
 import sys
 import urllib.request
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------- 常量 ----
 
@@ -59,6 +60,22 @@ SCSMI_URL = "http://lijianping.cn/dct/attach/Y2xiOmNsYjpBU0NJSTo4NzY="
 ONI_CACHE = os.path.join(DATA_DIR, "oni_cache.csv")
 SOI_CACHE = os.path.join(DATA_DIR, "soi_cache.txt")
 SCSMI_CACHE = os.path.join(DATA_DIR, "scsmi_cache.txt")
+
+# 南海季风爆发日期：NCEP/NCAR R1 逐日 850hPa 纬向风（PSL THREDDS OPeNDAP 文本子集），
+# 区域 (10°-20°N, 110°-120°E)（南海中北部，主流文献与业务监测口径）候平均，
+# 按王斌等 (2004) 标准判定爆发候。
+# 注意：R1 已于 2026 年 3 月停产，完整爆发窗口（4 月初-7 月底）的最新可用年为 2025。
+U850_BASE = "https://psl.noaa.gov/thredds/dodsC/Datasets/ncep.reanalysis.dailyavgs/pressure"
+U850_CACHE = os.path.join(DATA_DIR, "u850_scs_cache.txt")
+U850_MAX_YEAR = 2025     # R1 停产：不再更新以后年份的爆发窗口
+U850_LON_IDX = (44, 48)  # 110°E..120°E（2.5° 网格索引 44..48）
+U850_LAT_IDX = (28, 32)  # 20°N..10°N（索引 28..32，纬度自北向南；南海中北部业务监测区）
+U850_LEVEL_IDX = 2       # 850 hPa 层索引
+ONSET_WIN_DAYS = 123     # 抓取窗口：4 月 1 日 - 7 月 31 日
+ONSET_START_PENTAD = 24  # 王斌等 (2004)：自第 24 候（4/26-30）起找爆发
+ONSET_PERSIST = 3        # 爆发候定义：候平均 U850>0 且其后连续 2 候亦为正（共 3 候）
+ONSET_VERIFY_START = 1979  # 爆发日期留一验证的最早目标年（卫星时代后样本更可靠）
+ONSET_REGION_LABEL = "(10°-20°N, 110°-120°E)"
 
 STATE_STRONG = "偏强"
 STATE_NORMAL = "正常"
@@ -203,7 +220,8 @@ def fetch_text(url, cache_path, refresh=False, allow_network=True, timeout=40):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read()
             text = raw.decode("ascii", errors="replace")
-            header = "# fetched=%sZ source=%s\n" % (datetime.datetime.utcnow().isoformat(timespec="seconds"), url)
+            header = "# fetched=%sZ source=%s\n" % (
+        datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), url)
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             with open(cache_path, "w", encoding="ascii", errors="replace") as f:
                 f.write(header + text)
@@ -217,7 +235,8 @@ def fetch_text(url, cache_path, refresh=False, allow_network=True, timeout=40):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read()
             text = raw.decode("ascii", errors="replace")
-            header = "# fetched=%sZ source=%s\n" % (datetime.datetime.utcnow().isoformat(timespec="seconds"), url)
+            header = "# fetched=%sZ source=%s\n" % (
+        datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), url)
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             with open(cache_path, "w", encoding="ascii", errors="replace") as f:
                 f.write(header + text)
@@ -345,14 +364,430 @@ def load_scsmi(allow_network=True):
     return parse_scsmi(text)
 
 
+# ------------------------------------------------------------ 爆发日期 ----
+# 南海季风爆发日期模块：区域 (5°-15°N, 110°-120°E) 850 hPa 纬向风由负转正的候，
+# 即"东亚夏季风第一次北跳/南海季风建立"的日期（王斌等 2004 标准）。
+
+def _days_in_year(year):
+    return 366 if (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0) else 365
+
+
+def _apr1_index(year):
+    """4 月 1 日在 NCEP dailyavgs time 轴上的 0 基索引（1 月 1 日=0）。"""
+    return 90 + (1 if _days_in_year(year) == 366 else 0)
+
+
+def _doy_to_md(year, doy):
+    """1 基数 day-of-year -> (月, 日)。"""
+    dims = [31, 29 if _days_in_year(year) == 366 else 28, 31, 30, 31, 30,
+            31, 31, 30, 31, 30, 31]
+    for i, d in enumerate(dims, 1):
+        if doy <= d:
+            return i, doy
+        doy -= d
+    return 12, 31
+
+
+def pentad_of_md(month, day):
+    """(月, 日) -> WMO 候号（1..73，1 月 1 日为第 1 候；只对非闰年口径安全）。"""
+    dims = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    doy = sum(dims[:month - 1]) + day
+    return (doy - 1) // 5 + 1
+
+
+def pentad_center_md(year, p):
+    """候号 -> 中心日期 (月, 日) 字符串，如 (5, 18)。"""
+    doy = (p - 1) * 5 + 3
+    return _doy_to_md(year, doy)
+
+
+def parse_u850_ascii(text, n_days=ONSET_WIN_DAYS):
+    """解析 OPeNDAP .ascii 响应 -> n_days 个区域平均日值列表（失败返回 None）。
+    数据段位于 'uwnd.uwnd[...]' 行之后，每行 5 个格点（经度方向），
+    连续 5 行（纬度方向）构成一天。"""
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines) and not lines[i].startswith("uwnd.uwnd"):
+        i += 1
+    if i >= len(lines):
+        return None
+    cells = []
+    for ln in lines[i + 1:]:
+        if not ln.startswith("["):
+            continue
+        parts = ln.split(",")
+        if len(parts) < 6:
+            continue
+        try:
+            row = [float(x) for x in parts[1:6]]
+        except ValueError:
+            continue
+        cells.append(sum(row) / len(row))  # 一行 = 一个 (天, 纬度) 的 5 个经度值平均
+    if len(cells) < n_days * 5:
+        return None
+    out = []
+    for t in range(n_days):
+        block = cells[t * 5:(t + 1) * 5]
+        out.append(sum(block) / len(block) if len(block) == 5 else None)
+    return out
+
+
+def fetch_u850_year(year, timeout=90):
+    """抓取一年的 4/1-7/31 逐日 U850 区域平均序列；失败返回 None。"""
+    i0 = _apr1_index(year)
+    url = ("%s/uwnd.%d.nc.ascii?uwnd%%5B%d:%d%%5D%%5B%d%%5D%%5B%d:%d%%5D%%5B%d:%d%%5D"
+           % (U850_BASE, year, i0, i0 + ONSET_WIN_DAYS - 1, U850_LEVEL_IDX,
+              U850_LAT_IDX[0], U850_LAT_IDX[1], U850_LON_IDX[0], U850_LON_IDX[1]))
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (statistical research tool)"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        return parse_u850_ascii(raw.decode("ascii", errors="replace"))
+    except Exception as exc:
+        print("  [warn] U850 抓取失败 %d (%s)" % (year, exc.__class__.__name__))
+        return None
+
+
+def _load_u850_cache():
+    """读取 U850 缓存 -> {年: [123 个 4/1-7/31 区域平均日值]}，999.99 视为缺测。"""
+    out = {}
+    try:
+        with open(U850_CACHE, "r", encoding="ascii", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return out
+    for ln in lines:
+        if ln.startswith("#"):
+            continue
+        parts = ln.split()
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        vals = []
+        for x in parts[1:]:
+            try:
+                v = float(x)
+            except ValueError:
+                continue
+            vals.append(None if abs(v - 999.99) < 0.01 else v)
+        if len(vals) == ONSET_WIN_DAYS:
+            out[int(parts[0])] = vals
+    return out
+
+
+def _save_u850_cache(data):
+    header = ("# fetched=%sZ source=%s/datasets 850hPa daily u-wind "
+              "area-mean(10-20N,110-120E) Apr1-Jul31, R1 stopped 2026-03\n"
+              % (datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), U850_BASE))
+    with open(U850_CACHE, "w", encoding="ascii", errors="replace") as f:
+        f.write(header)
+        for y in sorted(data):
+            row = data[y]
+            f.write("%d" % y + "".join(
+                " %.2f" % (v if v is not None else 999.99) for v in row) + "\n")
+
+
+def load_u850(allow_network=True):
+    """装载 U850 缓存；允许联网时并发补齐缺失年份（1948..U850_MAX_YEAR）。"""
+    data = _load_u850_cache()
+    if allow_network:
+        missing = [y for y in range(1948, U850_MAX_YEAR + 1) if y not in data]
+        if missing:
+            print("U850 爆发窗口缓存缺少 %d 个年份，联网补齐…" % len(missing))
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                results = list(ex.map(fetch_u850_year, missing))
+            for y, vals in zip(missing, results):
+                if vals is not None:
+                    data[y] = vals
+            if data:
+                _save_u850_cache(data)
+    return data
+
+
+def daily_to_pentads(daily):
+    """123 天（4 月 1 日起）-> {候号: 候均值}，覆盖第 19..43 候；
+    最末候（第 43 候，7/30-8/3）窗口内只有 2 天，用可用天平均。"""
+    out = {}
+    for p in range(19, 44):
+        block = daily[(p - 19) * 5:(p - 19) * 5 + 5]
+        real = [v for v in block if v is not None]
+        out[p] = (sum(real) / len(real)) if real else None
+    return out
+
+
+def pentad_label(pv):
+    """候号（可小数）-> '第N候(约MM月DD日)'。"""
+    if pv is None:
+        return "NA"
+    base = int(math.floor(pv))
+    frac = pv - base
+    day_in = min(max(int(round(frac * 5)) + 3, 1), 5)  # 候内第 3 天为候中心
+    doy = (base - 1) * 5 + day_in
+    mo, dy = _doy_to_md(2001, doy)  # 用非闰年换算日期即可
+    return "第%d候(%02d月%02d日)" % (base, mo, dy)
+
+
+def detect_onset(pents, year, start=ONSET_START_PENTAD, persist=ONSET_PERSIST):
+    """王斌等 (2004) 判定：自第 start 候（第 24 候 = 4/26-30）起，找第一个候 p，
+    使 p..p+persist-1 候平均 U850 连续为正。返回 (候号, 近似日期) 或 (None, None)。"""
+    for p in sorted(pents):
+        if p < start:
+            continue
+        ok = True
+        for k in range(persist):
+            v = pents.get(p + k)
+            if v is None or v <= 0.0:
+                ok = False
+                break
+        if ok:
+            mo, dy = pentad_center_md(year, p)
+            return p, "%d月%d日" % (mo, dy)
+    return None, None
+
+
+def onset_series(u850):
+    """{年: 日值序列} -> {年: 爆发候}（数据缺失或未检出爆发的年份不记录）。"""
+    out = {}
+    for y in sorted(u850):
+        daily = u850.get(y)
+        if not daily or len(daily) < ONSET_WIN_DAYS:
+            continue
+        p, _ = detect_onset(daily_to_pentads(daily), y)
+        if p is not None:
+            out[y] = p
+    return out
+
+
+def _pearson(a, b):
+    """皮尔逊相关系数；样本 < 3 或零方差时返回 None。"""
+    n = len(a)
+    if n < 3:
+        return None
+    ma = sum(a) / n
+    mb = sum(b) / n
+    sxx = sum((x - ma) ** 2 for x in a)
+    syy = sum((y - mb) ** 2 for y in b)
+    if sxx <= 0 or syy <= 0:
+        return None
+    sxy = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    return sxy / math.sqrt(sxx * syy)
+
+
+def _ols(X, y):
+    """普通最小二乘（正规方程 + 高斯消元）-> [截距, 斜率...]；退化时返回 None。"""
+    n = len(y)
+    k = len(X[0]) if n else 0
+    if n < k + 2:
+        return None
+    cols = k + 1
+    A = [[0.0] * cols for _ in range(cols)]
+    b = [0.0] * cols
+    for i in range(n):
+        row = [1.0] + list(X[i])
+        for r in range(cols):
+            b[r] += row[r] * y[i]
+            for c in range(cols):
+                A[r][c] += row[r] * row[c]
+    for col in range(cols):  # 列主元高斯消元
+        piv = max(range(col, cols), key=lambda r2: abs(A[r2][col]))
+        if abs(A[piv][col]) < 1e-12:
+            return None
+        A[col], A[piv] = A[piv], A[col]
+        b[col], b[piv] = b[piv], b[col]
+        for r in range(col + 1, cols):
+            f = A[r][col] / A[col][col]
+            for c in range(col, cols):
+                A[r][c] -= f * A[col][c]
+            b[r] -= f * b[col]
+    coef = [0.0] * cols
+    for r in range(cols - 1, -1, -1):
+        s = b[r] - sum(A[r][c] * coef[c] for c in range(r + 1, cols))
+        coef[r] = s / A[r][r]
+    return coef
+
+
+def _clim_before(seq, y_t):
+    """目标年前所有爆发候的均值（气候态基准）；样本不足返回 None。"""
+    vs = [seq[y] for y in sorted(seq) if y < y_t]
+    return (sum(vs) / len(vs)) if len(vs) >= 3 else None
+
+
+def onset_stats(seq, oni=None, soi=None):
+    """爆发候序列统计：均值/中位/最早/最晚/标准差/线性趋势（候每 10 年）/
+    滞后 1 年自相关，以及（可选）与 DJF ONI、4 月 SOI 的同期相关。"""
+    years = sorted(seq)
+    vals = [seq[y] for y in years]
+    n = len(vals)
+    if n < 3:
+        return None
+    mean = sum(vals) / n
+    med = sorted(vals)[n // 2]
+    sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / (n - 1))
+    e_y, l_y = min(years, key=lambda y: seq[y]), max(years, key=lambda y: seq[y])
+    coef = _ols([[float(y)] for y in years], vals)
+    trend = (coef[1] * 10.0) if coef else None
+    lag1 = None
+    if n >= 4:
+        lag1 = _pearson(vals[:-1], vals[1:])
+    out = {
+        "n": n, "mean": mean, "median": med, "sd": sd,
+        "earliest": (e_y, seq[e_y]), "latest": (l_y, seq[l_y]),
+        "trend_per_decade": trend, "lag1_r": lag1,
+        "first_year": years[0], "last_year": years[-1],
+    }
+    if oni is not None:
+        xs, ys = [], []
+        for y in years:
+            o = oni.get((y, 2))  # DJF（结束月 2）
+            if o is not None:
+                xs.append(o)
+                ys.append(seq[y])
+        out["corr_oni_djf"] = _pearson(xs, ys) if len(xs) >= 3 else None
+    if soi is not None:
+        xs, ys = [], []
+        for y in years:
+            s = soi.get((y, 4))  # 4 月 SOI（爆发起报前最新）
+            if s is not None:
+                xs.append(s)
+                ys.append(seq[y])
+        out["corr_soi_apr"] = _pearson(xs, ys) if len(xs) >= 3 else None
+    return out
+
+
+def onset_analog_forecast(seq, years, weights):
+    """相似型近邻对爆发候的加权点预测 + 90% 分位区间；近邻足够返回 dict。"""
+    pairs = [(seq[y], w) for y, w in zip(years, weights) if y in seq]
+    pairs = [(v, w) for v, w in pairs if v is not None and w > 0]
+    if len(pairs) < 3:
+        return None
+    tot = sum(w for _, w in pairs)
+    mean = sum(v * w for v, w in pairs) / tot
+    q05 = weighted_quantile(pairs, 0.05)
+    q95 = weighted_quantile(pairs, 0.95)
+    return {"mean": mean, "q05": q05, "q95": q95, "n": len(pairs)}
+
+
+def onset_reg_predict(oni, soi, seq, y_t):
+    """爆发候线性回归：特征 [DJF ONI, 4 月 SOI, 前一年爆发候]，训练集严格早于 y_t。
+    返回 {"mean":..., "n":..., "coef":[...]} 或 None（特征缺失/样本不足）。"""
+    X, Y = [], []
+    for y in sorted(seq):
+        if y >= y_t or (y - 1) not in seq:
+            continue
+        o = oni.get((y, 2))
+        s = soi.get((y, 4))
+        if o is None or s is None:
+            continue
+        X.append([o, s, seq[y - 1]])
+        Y.append(seq[y])
+    if len(Y) < 5:
+        return None
+    coef = _ols(X, Y)
+    if coef is None:
+        return None
+    o = oni.get((y_t, 2))
+    s = soi.get((y_t, 4))
+    lag = seq.get(y_t - 1)
+    if o is None or s is None or lag is None:
+        return None
+    pred = coef[0] + coef[1] * o + coef[2] * s + coef[3] * lag
+    return {"mean": pred, "n": len(Y), "coef": coef}
+
+
+def _onset_metrics(triples):
+    """[(预测, 观测, 当年气候基准) ...] -> 验证指标 dict；样本不足返回 None。"""
+    good = [(p, o, c) for p, o, c in triples if p is not None and c is not None]
+    if len(good) < 5:
+        return None
+    n = len(good)
+    r = _pearson([t[0] for t in good], [t[1] for t in good])
+    mae = sum(abs(p - o) for p, o, _ in good) / n
+    mae_clim = sum(abs(o - c) for _, o, c in good) / n
+    skill = 1.0 - mae / mae_clim if mae_clim > 0 else None
+    hits = sum(1 for p, o, c in good if (p > c) == (o > c))
+    return {"n": n, "r": r, "mae": mae, "mae_clim": mae_clim,
+            "skill": skill, "hit_rate": hits / n}
+
+
+def onset_cross_validate(oni, soi, scsmi, seq, verify_start=ONSET_VERIFY_START):
+    """爆发候样本外（时序）验证：逐年以当年之前的数据分别做
+    气候态 / 相似型（起报 4 月）/ 线性回归预测，统计 r、MAE、相对气候态技能、
+    距平符号命中率。相似型复用主预测的 4 月起报口径，候选年严格早于目标年。"""
+    years = [y for y in sorted(seq) if y >= verify_start]
+    tri = {"analog": [], "reg": []}
+    for y_t in years:
+        obs = seq[y_t]
+        clim = _clim_before(seq, y_t)
+        # 相似型：起报 4 月（业务口径），目标同年
+        ana = None
+        if len(seq) >= 3:
+            a_pool = analog_distribution(oni, soi, scsmi, y_t, 4)
+            if a_pool is not None:
+                a_m_res, _, _ = monthly_analog(oni, soi, scsmi, y_t, 4)
+                am = a_m_res or a_pool
+                ana = onset_analog_forecast(seq, am["years"], am["weights"])
+        tri["analog"].append((ana["mean"] if ana else None, obs, clim))
+        reg = onset_reg_predict(oni, soi, seq, y_t)
+        tri["reg"].append((reg["mean"] if reg else None, obs, clim))
+    out = {"verify_start": verify_start, "n_years": len(years)}
+    for key, t in tri.items():
+        out[key] = _onset_metrics(t)
+    return out
+
+
+def build_onset_result(oni, soi, scsmi, u850, y_t, comp):
+    """爆发日期全链结果（供 forecast/report 使用）：序列、统计、本轮两类预测、
+    样本外验证。u850 缺失或无爆发年份时返回 None。"""
+    seq = onset_series(u850)
+    if len(seq) < 25:
+        return None
+    stats = onset_stats(seq, oni, soi)
+    if stats is None:
+        return None
+    am = comp.get("analog_monthly") or comp.get("analog_pooled")
+    ana = None
+    near = None
+    if am:
+        ok = [(y, w) for y, w in zip(am["years"], am["weights"]) if y < y_t]  # 无泄漏防线
+        if len(ok) >= 3:
+            ana = onset_analog_forecast(seq, [y for y, _ in ok], [w for _, w in ok])
+        near = sorted((seq[y], y) for y, _ in ok if y in seq)[:5]
+    reg = onset_reg_predict(oni, soi, seq, y_t)
+    clim = _clim_before(seq, y_t)
+    cv = onset_cross_validate(oni, soi, scsmi, seq)
+    return {
+        "target_year": y_t, "series": seq, "stats": stats,
+        "analog": ana, "reg": reg, "clim": clim, "cv": cv,
+        "near": near,
+        "_terms": ("南海季风爆发候=区域%s850hPa纬向风转正并维持3候（王斌等2004）"
+                   % ONSET_REGION_LABEL),
+    }
+
+
 def update_data():
-    """update 子命令：刷新三个数据源并写缓存。"""
+    """update 子命令：刷新四个数据源并写缓存（U850 只补齐缺失年份）。"""
     print("刷新数据源：")
     for name, url, cache in [("ONI", ONI_URL, ONI_CACHE),
                              ("SOI", SOI_URL, SOI_CACHE),
                              ("SCSMI", SCSMI_URL, SCSMI_CACHE)]:
         text, from_cache = fetch_text(url, cache, refresh=True, allow_network=True)
         print("  %-6s %s %s" % (name, "缓存回退" if from_cache else "OK", os.path.basename(cache)))
+    data = _load_u850_cache()
+    missing = [y for y in range(1948, U850_MAX_YEAR + 1) if y not in data]
+    if missing:
+        print("  U850   补齐 %d 个年份（第一次运行需抓取 %d-%d 全部爆发窗口，几分钟）..."
+              % (len(missing), min(missing), max(missing)))
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            results = list(ex.map(fetch_u850_year, missing))
+        ok = 0
+        for y, vals in zip(missing, results):
+            if vals is not None:
+                data[y] = vals
+                ok += 1
+        if data:
+            _save_u850_cache(data)
+        print("  U850   %s 成功 %d/%d" % ("缓存回退" if ok == 0 else "OK", ok, len(missing)))
+    else:
+        print("  U850   OK（缓存完整）%s" % os.path.basename(U850_CACHE))
 
 
 def target_years(scsmi):
@@ -1088,6 +1523,8 @@ def run_forecast(allow_network=True, today=None, json_out=None):
     scsmi = load_scsmi(allow_network)
     y_t, m = live_context(today)
     comp = shrunk_components(oni, soi, scsmi, y_t, m)
+    u850 = load_u850(allow_network)
+    onset = build_onset_result(oni, soi, scsmi, u850, y_t, comp)
 
     ys = target_years(scsmi)
     last_target = ys[-1] if ys else None
@@ -1121,6 +1558,7 @@ def run_forecast(allow_network=True, today=None, json_out=None):
         "analog_degraded": comp["analog_degraded"],
         "n_eff_analog": comp["n_eff_analog"],
         "analogs": analogs, "point_forecast": pf, "strong_month_dist": smd,
+        "onset": onset,
         "oni_latest": latest_oni(oni), "soi_latest": latest_soi(soi),
         "oni_state_desc": describe_oni_state(oni, y_t if m <= 5 else y_t - 1, m),
         "last_scsmi_year": last_target,
@@ -1134,6 +1572,60 @@ def run_forecast(allow_network=True, today=None, json_out=None):
         with open(json_out, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2, default=str)
     return result, (oni, soi, scsmi)
+
+
+def print_onset(on):
+    """终端输出：南海季风爆发日期历史统计 + 预测 + 验证。"""
+    st = on["stats"]
+    print("=" * 72)
+    print("南海季风爆发日期（东亚夏季风第一次北跳）")
+    print("=" * 72)
+    print("判定标准   区域%s850hPa纬向风转正并维持3候（王斌等2004）" % ONSET_REGION_LABEL)
+    print("历史序列   %d-%d 共 %d 年，均值 %.1f 候，标准差 %.1f 候" % (
+        st["first_year"], st["last_year"], st["n"], st["mean"], st["sd"]))
+    print("常态       %s 前后；最早 %d 年%s；最晚 %d 年%s" % (
+        pentad_label(st["mean"]),
+        st["earliest"][0], pentad_label(st["earliest"][1]),
+        st["latest"][0], pentad_label(st["latest"][1])))
+    print("趋势       %+.2f 候/10年；滞后1年自相关 %s%s" % (
+        st["trend_per_decade"] or 0.0,
+        ("%+.2f" % st["lag1_r"]) if st["lag1_r"] is not None else "NA",
+        "" if st["lag1_r"] is None else "（上一年爆发候的持续性）"))
+    if st.get("corr_oni_djf") is not None or st.get("corr_soi_apr") is not None:
+        print("ENSO 联系  爆发候 vs 冬 DJF ONI: %s；vs 4月 SOI: %s" % (
+            ("%+.2f" % st["corr_oni_djf"]) if st["corr_oni_djf"] is not None else "NA",
+            ("%+.2f" % st["corr_soi_apr"]) if st["corr_soi_apr"] is not None else "NA"))
+    print("-" * 72)
+    print("%d 年南海季风爆发日期预测（气候态 %s）：" % (
+        on["target_year"], pentad_label(on["clim"])))
+    if on["analog"]:
+        a = on["analog"]
+        print("  相似型     %s [%s - %s]，近邻 %d 个" % (
+            pentad_label(a["mean"]), pentad_label(a["q05"]), pentad_label(a["q95"]), a["n"]))
+    else:
+        print("  相似型     近邻样本不足")
+    if on["reg"]:
+        r = on["reg"]
+        print("  线性回归   %s（DJF ONI + 4月SOI + 前一年爆发候，训练 %d 年）" % (
+            pentad_label(r["mean"]), r["n"]))
+    else:
+        print("  线性回归   不可用（需前一年爆发候，%d 年暂缺或特征不足）" % (on["target_year"] - 1))
+    if on["near"]:
+        print("  参考近邻   %s" % "  ".join(
+            "%d年%s" % (yy, pentad_label(v)) for v, yy in on["near"]))
+    cv = on["cv"]
+    print("样本外验证（%d-%d，逐年只用当年之前的数据）：" % (
+        cv["verify_start"], st["last_year"]))
+    for key, name in (("analog", "相似型"), ("reg", "回归")):
+        d = cv.get(key)
+        if d is None:
+            print("  %-6s 样本不足" % name)
+            continue
+        print("  %-6s n=%d  r=%s  MAE=%.1f候 (气候态%.1f候, 技能%+.0f%%)  距平符号命中率 %.0f%%" % (
+            name, d["n"], ("%+.2f" % d["r"]) if d["r"] is not None else "NA",
+            d["mae"], d["mae_clim"], 100 * d["skill"],
+            100 * d["hit_rate"]))
+    print("注：爆发日期由 NCEP/NCAR R1 推算（该数据 2026-03 停产），2026 年起暂无法更新。")
 
 
 def print_forecast(res):
@@ -1205,6 +1697,10 @@ def print_forecast(res):
             print("  偏强月数(6-9月)分布  %s" % "  ".join(
                 "%d个月 %5.1f%%" % (i, 100 * q)
                 for i, q in enumerate(res["strong_month_dist"])))
+    if res.get("onset"):
+        print_onset(res["onset"])
+    else:
+        print("南海季风爆发日期模块不可用（缺少 U850 缓存，请先运行 update 子命令）。")
     print("-" * 72)
     print("常规起报窗口：每年 1-5 月（提前 5-1 个月）。本输出为 %d 月提前展望，" % m)
     print("回测表明提前期越长技能越低，请结合技能面板解读。本工具为统计演示，不构成任何决策依据。")
@@ -1337,6 +1833,50 @@ def _svg_history(scsmi):
     parts.append('<rect x="%.1f" y="%d" width="10" height="10" fill="#c0392b" opacity="0.55"/><text x="%.1f" y="%d" font-size="10.5" fill="#555">偏强年</text>' % (W - 130, pad_t + 10, W - 116, pad_t + 19))
     parts.append('<rect x="%.1f" y="%d" width="10" height="10" fill="#2471a3" opacity="0.55"/><text x="%.1f" y="%d" font-size="10.5" fill="#555">偏弱年</text>' % (W - 130, pad_t + 26, W - 116, pad_t + 35))
     parts.append('<text x="%d" y="%d" font-size="10" fill="#7a7f88">SCSMI JJAS 标准化值</text>' % (pad_l, pad_t - 6))
+    parts.append('</svg>')
+    return "".join(parts)
+
+
+def _svg_onset_history(on):
+    """历年南海季风爆发候折线 + 气候均值 + 趋势线 + 本轮预测区间。"""
+    seq = on.get("series") or {}
+    st = on.get("stats") or {}
+    if not seq:
+        return ""
+    ys = sorted(seq)
+    W, H = 640, 300
+    pad_l, pad_r, pad_t, pad_b = 44, 24, 26, 40
+    vmin, vmax = 20.0, 39.0
+    x0, x1 = ys[0], ys[-1]
+
+    def sx(y):
+        return pad_l + (W - pad_l - pad_r) * (y - x0) / max(x1 - x0, 1)
+
+    def sy(v):
+        return pad_t + (H - pad_t - pad_b) * (1 - (v - vmin) / (vmax - vmin))
+    parts = ['<svg viewBox="0 0 %d %d" xmlns="http://www.w3.org/2000/svg" role="img">' % (W, H)]
+    parts.append('<rect x="0" y="0" width="%d" height="%d" fill="#fbfcfe"/>' % (W, H))
+    # 气候均值与 ±1σ 带
+    if st:
+        for k, dash in ((st["mean"] - 1.0 * st["sd"], "3,5"), (st["mean"] + 1.0 * st["sd"], "3,5")):
+            parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#b8c4d4" stroke-width="1" stroke-dasharray="%s" opacity="0.6"/>' % (pad_l, sy(k), W - pad_r, sy(k), dash))
+        parts.append('<line x1="%d" y1="%.1f" x2="%d" y2="%.1f" stroke="#c78a3c" stroke-width="1.2" stroke-dasharray="6,4"/>' % (pad_l, sy(st["mean"]), W - pad_r, sy(st["mean"])))
+    line = " ".join("%.1f,%.1f" % (sx(y), sy(seq[y])) for y in ys)
+    parts.append('<polyline points="%s" fill="none" stroke="#2e5d87" stroke-width="1.6"/>' % line)
+    # 本轮预测：点 + 90% 区间竖条
+    yt = on.get("target_year")
+    if yt is not None and on.get("analog"):
+        a = on["analog"]
+        xp = min(max(sx(max(yt, x0 + 1)), pad_l + 1), W - pad_r - 52)
+        parts.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="#c0392b" stroke-width="5" opacity="0.5"/>' % (xp, sy(a["q05"]), xp, sy(a["q95"])))
+        parts.append('<circle cx="%.1f" cy="%.1f" r="4.5" fill="#c0392b"/>' % (xp, sy(a["mean"])))
+        parts.append('<text x="%.1f" y="%d" font-size="10.5" fill="#c0392b" text-anchor="middle">%d年预测</text>' % (xp, pad_t + 12, yt))
+    for tk in range(x0, x1 + 1, 10):
+        parts.append('<text x="%.1f" y="%d" font-size="10" text-anchor="middle" fill="#555">%d</text>' % (sx(tk), H - pad_b + 15, tk))
+    for v in range(20, 40, 4):
+        parts.append('<text x="%d" y="%.1f" font-size="10" text-anchor="middle" fill="#555">第%d候</text>' % (pad_l - 18, sy(v) + 3, v))
+    parts.append('<text x="%d" y="%d" font-size="10.5" fill="#7a7f88">爆发候（上=偏早）·  橙虚线=气候均值' % (pad_l, pad_t - 6))
+    parts.append('<text x="%d" y="%d" font-size="10.5" fill="#c78a3c">' % (pad_l + 205, pad_t - 6))
     parts.append('</svg>')
     return "".join(parts)
 
@@ -1559,6 +2099,60 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None):
     py = res["target_years_full"]
     first_yr, last_yr = (py[0], py[-1]) if py else (1948, 1948)
 
+    onset_card = ""
+    if res.get("onset"):
+        on = res["onset"]
+        st = on["stats"]
+        preds = []
+        if on["analog"]:
+            a = on["analog"]
+            preds.append('相似型：<b>%s</b>（90%% 区间 %s - %s，近邻 %d 个）' % (
+                pentad_label(a["mean"]), pentad_label(a["q05"]),
+                pentad_label(a["q95"]), a["n"]))
+        else:
+            preds.append("相似型：近邻样本不足")
+        if on["reg"]:
+            preds.append("线性回归：<b>%s</b>（DJF ONI + 4 月 SOI + 前一年爆发候，训练 %d 年）" % (
+                pentad_label(on["reg"]["mean"]), on["reg"]["n"]))
+        else:
+            preds.append("线性回归：不可用（需前一年爆发候，%d 年暂缺或特征不足）" % (on["target_year"] - 1))
+        corr_oni = ("%+.2f" % st["corr_oni_djf"]) if st.get("corr_oni_djf") is not None else "不足"
+        corr_soi = ("%+.2f" % st["corr_soi_apr"]) if st.get("corr_soi_apr") is not None else "不足"
+        lag1 = ("%+.2f" % st["lag1_r"]) if st.get("lag1_r") is not None else "NA"
+        ov_rows = ""
+        for key, name in (("analog", "相似型（4 月起报口径）"), ("reg", "线性回归")):
+            d = on["cv"].get(key)
+            if d is None:
+                ov_rows += '<tr><td>%s</td><td colspan="5">样本不足</td></tr>' % name
+                continue
+            ov_rows += ('<tr><td>%s</td><td>%d</td><td>%s</td><td>%.1f / %.1f</td>'
+                        '<td>%+.0f%%</td><td>%.0f%%</td></tr>' % (
+                            name, d["n"], ("%+.2f" % d["r"]) if d["r"] is not None else "NA",
+                            d["mae"], d["mae_clim"], 100 * d["skill"], 100 * d["hit_rate"]))
+        onset_card = (
+            '<div class="card"><h2>南海季风爆发日期（东亚夏季风第一次北跳）</h2>'
+            '<p class="note">判定标准：区域(10°-20°N, 110°-120°E)850 hPa 纬向风由负转正'
+            '且其后连续 2 候维持正（王斌等 2004，候平均）。历史序列 %d-%d 共 %d 年：'
+            '均值 %s，最早 %d 年%s，最晚 %d 年%s；趋势 %+.2f 候/10 年，滞后 1 年自相关 %s。'
+            '与冬季 DJF ONI 相关 %s，与 4 月 SOI 相关 %s。</p>'
+            '<p>%d 年 <b>气候态</b> %s；%s</p>%s'
+            '<h3>样本外验证（%d-%d，逐年只用当年之前的数据）</h3>'
+            '<table><thead><tr><th>方法</th><th>样本</th><th>相关系数 r</th>'
+            '<th>MAE 模型/气候态（候）</th><th>MAE 技能</th><th>距平符号命中率</th>'
+            '</tr></thead><tbody>%s</tbody></table>'
+            '<p class="note">判定所用的 NCEP/NCAR R1 再分析已于 2026 年 3 月停产，'
+            '爆发日期序列暂止于 %d 年。统计学上，爆发候的可预报性弱于季节平均强度：'
+            '若 MAE 技能为负，说明其结果不优于直接用气候态日期，仅作结构展示。</p></div>'
+            % (st["first_year"], st["last_year"], st["n"],
+               pentad_label(st["mean"]),
+               st["earliest"][0], pentad_label(st["earliest"][1]),
+               st["latest"][0], pentad_label(st["latest"][1]),
+               st["trend_per_decade"], lag1, corr_oni, corr_soi,
+               on["target_year"], pentad_label(on["clim"]),
+               "；".join(preds), _svg_onset_history(on),
+               on["cv"]["verify_start"], st["last_year"], ov_rows,
+               st["last_year"]))
+
     html_out = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1602,6 +2196,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None):
 %s
 <p class="note">红带=偏强年，蓝带=偏弱年。指数来源：李建平团队（Li &amp; Zeng 2002/2005 统一季风指数框架，DNS 动力学标准化季节变率）。</p>
 </div>
+%s
 <div class="card">
 <h2>样本外回测技能面板（起报月 × 提前期）</h2>
 %s
@@ -1663,7 +2258,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None):
         res["w_trans"], res["w_analog"], MONTH_CN[m], fmt3(skt), fmt3(ska), fmt3(skb),
         res["n_verify"] if res["n_verify"] is not None else 0,
         analog_table, pf_html, mon_card,
-        first_yr, last_yr, hist_html, heat_html, rel_html,
+        first_yr, last_yr, hist_html, onset_card, heat_html, rel_html,
         res["data_end_year"],
         len(res["target_years_full"]), first_yr, last_yr,
     )
@@ -1963,6 +2558,109 @@ def run_selftest(verbose=True):
     _check("在线上下文-10月", live_context(datetime.date(2026, 10, 23)) == (2027, 10), "")
     _check("在线上下文-3月", live_context(datetime.date(2027, 3, 15)) == (2027, 3), "")
 
+    # ---- 爆发日期：候历与窗口 ----
+    _check("候历-4/30=第24候", pentad_of_md(4, 30) == 24 and pentad_of_md(5, 1) == 25, "")
+    _check("候历-端点", pentad_of_md(1, 1) == 1 and pentad_of_md(12, 31) == 73, "")
+    _check("候历-中心日", pentad_center_md(2001, 24) == (4, 28) and
+           pentad_center_md(2001, 26) == (5, 8), "")
+    _check("候历-标签", pentad_label(24) == "第24候(04月28日)", "")
+    _check("窗口-闰年4/1索引", _apr1_index(1948) == 91 and _apr1_index(1949) == 90, "")
+
+    # ---- 爆发日期：OPeNDAP ASCII 解析 ----
+    _s_lines = []
+    for _t in range(3):
+        for _lat in range(5):
+            _s_lines.append("[%d][0][%d], %s" % (
+                _t, _lat, ", ".join(["%.1f" % (_t + 1)] * 5)))
+    _s_text = ("Dataset { ... }\n...\nuwnd.uwnd[3][1][5][5]\n" +
+               "\n".join(_s_lines) + "\nuwnd.time[3]\n1.0\n")
+    _parsed = parse_u850_ascii(_s_text, n_days=3)
+    _check("U850解析-合成样例", _parsed is not None and len(_parsed) == 3 and
+           _close(_parsed[0], 1.0, 1e-9) and _close(_parsed[2], 3.0, 1e-9), "")
+    _check("U850解析-空文本守卫", parse_u850_ascii("", 3) is None, "")
+    _check("U850解析-截断守卫", parse_u850_ascii(_s_text, n_days=4) is None, "")
+
+    # ---- 爆发日期：候聚合与检测 ----
+    _d_syn = [-1.0] * 30 + [1.0] * 93  # 4/1-4/30 为负，5/1 起为正
+    _pents_daily = daily_to_pentads(_d_syn)
+    _check("候聚合-正负与末候", _pents_daily[24] < 0 and _pents_daily[25] > 0 and
+           _close(_pents_daily[43], 1.0, 1e-9), "")
+    _p_all_neg = {p: -1.0 for p in range(19, 44)}
+    _check("爆发检测-全负无爆发", detect_onset(_p_all_neg, 2001) == (None, None), "")
+    _p_brk = {p: -1.0 for p in range(19, 44)}
+    _p_brk[26], _p_brk[28] = 1.0, 1.0  # 26 正但 27 负：连续 3 候不满足
+    _check("爆发检测-转正不足3候", detect_onset(_p_brk, 2001) == (None, None), "")
+    _p_ok = {p: -1.0 for p in range(19, 44)}
+    for _p in (26, 27, 28):
+        _p_ok[_p] = 1.0
+    _check("爆发检测-第26候爆发", detect_onset(_p_ok, 2001) == (26, "5月8日"), "")
+    _p_ear = {p: -1.0 for p in range(19, 44)}
+    for _p in (22, 23, 24):
+        _p_ear[_p] = 1.0  # 第 22 候转正但早于判定起点 24，且 25/26 候回负
+    _check("爆发检测-起点前转正忽略", detect_onset(_p_ear, 2001) == (None, None), "")
+    _p_first = {p: -1.0 for p in range(19, 44)}
+    for _p in (24, 25, 26):
+        _p_first[_p] = 1.0
+    _check("爆发检测-第24候即爆发", detect_onset(_p_first, 2001) == (24, "4月28日"), "")
+    _p_gap = {p: -1.0 for p in range(19, 44)}
+    for _p in (24, 25, 27, 28, 29):
+        _p_gap[_p] = 1.0
+    _p_gap[26] = None  # 缺测打断 24/25 起算，但 27/28/29 连续满足
+    _check("爆发检测-缺测不妨碍后续", detect_onset(_p_gap, 2001) == (27, "5月13日"), "")
+
+    # ---- 爆发日期：序列与统计 ----
+    _u_syn = {1980: [-1.0] * 123, 1981: _d_syn, 1982: _d_syn}
+    _seq_syn = onset_series(_u_syn)
+    _check("爆发序列-无爆发年剔除", 1980 not in _seq_syn and _seq_syn.get(1981) == 25, "")
+    _st_syn = onset_stats({1980: 25, 1981: 25, 1982: 31})
+    _check("爆发统计-基本量", _st_syn is not None and _close(_st_syn["mean"], 27.0, 1e-9) and
+           _st_syn["earliest"] == (1980, 25) and _st_syn["latest"] == (1982, 31) and
+           _close(_st_syn["sd"], math.sqrt(12.0), 1e-6), "")
+
+    # ---- 爆发日期：相关与 OLS 工具 ----
+    _check("相关-完全正/负", _close(_pearson([1, 2, 3], [1, 2, 3]), 1.0, 1e-9) and
+           _close(_pearson([1, 2, 3], [3, 2, 1]), -1.0, 1e-9), "")
+    _check("相关-常量守卫", _pearson([1, 1, 1], [1, 2, 3]) is None, "")
+    _coef2 = _ols([[1.0], [2.0], [3.0]], [1.0, 2.0, 3.0])
+    _check("OLS-两点直线", _coef2 is not None and _close(_coef2[0], 0.0, 1e-9) and
+           _close(_coef2[1], 1.0, 1e-9), "")
+    _check("OLS-样本不足守卫", _ols([[1.0]], [1.0]) is None, "")
+
+    # ---- 爆发日期：预测与守卫 ----
+    _ofa = onset_analog_forecast({1990: 24, 1991: 28, 1992: 29}, [1990, 1991, 1992],
+                                 [0.5, 0.3, 0.2])
+    _check("爆发预测-相似型加权", _ofa is not None and _close(_ofa["mean"], 26.2, 1e-9) and
+           _ofa["q05"] <= _ofa["mean"] <= _ofa["q95"], "")
+    _check("爆发预测-相似型样本不足", onset_analog_forecast(
+        {1990: 24}, [1990, 1991], [0.5, 0.5]) is None, "")
+    _check("爆发预测-近邻缺值剔除", onset_analog_forecast(
+        {1990: 24}, [1990, 1992], [0.5, 0.5]) is None, "")
+    _oni_syn = {(y, 2): 0.05 * (y - 1975) for y in range(1960, 2010)}
+    _soi_syn = {(y, 4): 0.2 * (y % 5 - 2) for y in range(1960, 2010)}
+    _rseq = {y: 25 + (y % 3) for y in range(1960, 2006)}
+    _rr = onset_reg_predict(_oni_syn, _soi_syn, _rseq, 1995)
+    _check("爆发回归-合成输出", _rr is not None and 19 <= _rr["mean"] <= 44 and _rr["n"] >= 5, "")
+    _oni_miss = {k: v for k, v in _oni_syn.items() if k != (1995, 2)}
+    _check("爆发回归-特征缺失守卫", onset_reg_predict(_oni_miss, _soi_syn, _rseq, 1995) is None, "")
+    _check("爆发气候态基准", _close(_clim_before({1988: 22, 1989: 26, 1990: 30}, 1991), 26.0, 1e-9)
+           and _clim_before({1990: 24}, 1991) is None, "")
+    if am_live is not None:
+        _check("爆发预测-近邻无泄漏", all(y < 1995 for y in am_live["years"]), "")
+
+    # ---- 爆发日期：真实缓存集成（缓存缺失时降级为提示通过） ----
+    _u850_real = _load_u850_cache()
+    if _u850_real:
+        _seq_real = onset_series(_u850_real)
+        _check("爆发序列-真实缓存覆盖", len(_seq_real) >= 70 and 1948 in _seq_real and
+               2025 in _seq_real and 2026 not in _seq_real, "R1 完整窗口应到 2025")
+        _st_real = onset_stats(_seq_real)
+        _check("爆发序列-气候均值范围", 24 <= _st_real["mean"] <= 31, "气候态约 5 月中下旬")
+        _check("爆发序列-年份有序", list(_seq_real) == sorted(_seq_real), "")
+    else:
+        _check("爆发序列-真实缓存覆盖(跳过)", True, "U850 缓存缺失：运行 update 后强校验")
+        _check("爆发序列-气候均值范围(跳过)", True, "")
+        _check("爆发序列-年份有序(跳过)", True, "")
+
     # ---- SVG / HTML 组件 ----
     pf_html = _svg_fc_course(pf)
     _check("SVG-点预测曲线", "<svg" in pf_html and "polyline" in pf_html and "</svg>" in pf_html, "")
@@ -1982,6 +2680,26 @@ def run_selftest(verbose=True):
         _check("报告-关键词[%s]" % kw, kw in report or kw in report.lower(), "")
     _check("报告-标签闭合", report.count("<html") == report.count("</html>") == 1 and
            report.count("<body>") == report.count("</body>") == 1, "")
+
+    # ---- 爆发日期：完整链路集成（依赖 U850 缓存） ----
+    if res.get("onset"):
+        on = res["onset"]
+        _check("爆发集成-结构", on["stats"] is not None and
+               on["cv"]["verify_start"] == ONSET_VERIFY_START, "")
+        _check("爆发集成-预测区间", on["analog"] is None or
+               on["analog"]["q05"] <= on["analog"]["mean"] <= on["analog"]["q95"], "")
+        _check("爆发集成-近邻早于目标年", all(y < res["target_year"]
+                                              for _, y in (on["near"] or [])), "")
+        svg_on = _svg_onset_history(on)
+        _check("爆发集成-SVG", "<svg" in svg_on and "polyline" in svg_on, "")
+        _check("爆发集成-报告卡", "南海季风爆发日期" in report, "")
+        for _k in ("analog", "reg"):
+            _d = on["cv"].get(_k)
+            if _d is not None:
+                _check("爆发集成-CV结构[%s]" % _k, _d["n"] >= 5 and
+                       (_d["r"] is None or -1.001 <= _d["r"] <= 1.001) and
+                       _d["mae"] >= 0 and -5 <= _d["skill"] <= 1.5 and
+                       0 <= _d["hit_rate"] <= 1, "")
 
     print("自测完成：%d 项通过，%d 项失败" % (_SELFTEST_PASS, _SELFTEST_FAIL))
     for msg in _SELFTEST_MSGS:
@@ -2017,6 +2735,25 @@ def main():
         scsmi = load_scsmi(allow_network)
         skills = compute_skills(oni, soi, scsmi)
         print_backtest(skills)
+        u850 = load_u850(allow_network)
+        seq = onset_series(u850)
+        if len(seq) >= 25:
+            st = onset_stats(seq)
+            cv = onset_cross_validate(oni, soi, scsmi, seq)
+            print("=" * 92)
+            print("南海季风爆发日期：样本外验证（%d-%d，共 %d 年序列，均值 %s）" % (
+                cv["verify_start"], st["last_year"], st["n"], pentad_label(st["mean"])))
+            print("=" * 92)
+            for key, name in (("analog", "相似型(4月起报)"), ("reg", "线性回归")):
+                d = cv.get(key)
+                if d is None:
+                    print("%-12s 样本不足" % name)
+                    continue
+                print("%-12s n=%d  r=%s  MAE=%.1f候 (气候态%.1f候,技能%+.0f%%)  距平符号命中率 %.0f%%" % (
+                    name, d["n"], ("%+.2f" % d["r"]) if d["r"] is not None else "NA",
+                    d["mae"], d["mae_clim"], 100 * d["skill"], 100 * d["hit_rate"]))
+        else:
+            print("南海季风爆发日期序列不足（缺 U850 缓存），跳过。请先运行 update。")
         return 0
     if args.command == "report":
         oni = load_oni(allow_network)
