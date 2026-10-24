@@ -1,4 +1,4 @@
-# fetched=2026-10-24T12:44:04+00:00Z source=http://lijianping.cn/dct/attach/Y2xiOmNsYjpBU0NJSTo4NzY=
+# fetched=2026-10-24T13:56:52+00:00Z source=http://lijianping.cn/dct/attach/Y2xiOmNsYjpBU0NJSTo4NzY=
  RAW: the raw SCSMI series. NORM: the normalized SCSMI series.   The value of 99.99 is undefined.
          RAW    RAW    RAW    RAW    RAW   NORM   NORM   NORM   NORM   NORM
          Jun    Jul    Aug    Sep   JJAS    Jun    Jul    Aug    Sep   JJAS

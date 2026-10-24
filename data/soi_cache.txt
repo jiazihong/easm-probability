@@ -1,4 +1,4 @@
-# fetched=2026-10-24T12:36:09Z source=https://www.cpc.ncep.noaa.gov/data/indices/soi
+# fetched=2026-10-24T13:56:50+00:00Z source=https://www.cpc.ncep.noaa.gov/data/indices/soi
 (STAND TAHITI - STAND DARWIN)  SEA LEVEL PRESS                                  
                         ANOMALY                                                 
                                                                                 
