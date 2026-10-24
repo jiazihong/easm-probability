@@ -20,8 +20,9 @@
   4. 组合权重按样本外三分类 Brier 技能分分配，负技能剔除，双负退化等权
   5. 90% 区间来自 Dirichlet 蒙特卡洛抽样（固定种子）
   6. 相似年份透明化 + 夏季逐月强度（6/7/8/9 月与 JJAS）加权点预测
-  7. 技能面板：起报月（1-12 月）× 其唯一提前期（1-12 个月）的 Brier 技能
-  8. 概率可靠性校准曲线
+  7. 逐月三档概率（相似型计票 + Dirichlet 后验区间）与偏强月数分布
+  8. 技能面板：起报月（1-12 月）× 其唯一提前期（1-12 个月）的 Brier 技能
+  9. 概率可靠性校准曲线
 
 起报月约定：月 m ∈ 1..12；若 m ≤ 5 目标为同年 JJAS，若 m ≥ 6 目标为次年 JJAS。
 提前期 L = 6-m（m≤5）或 18-m（m≥6），即距目标夏季（6 月）的月数。
@@ -913,8 +914,161 @@ def point_forecast(comp, scsmi):
         mean = sum(v * w for v, w in pairs) / sum(w for _, w in pairs)
         q05 = weighted_quantile(pairs, 0.05)
         q95 = weighted_quantile(pairs, 0.95)
-        series.append({"name": mname, "mean": mean, "q05": q05, "q95": q95})
+        entry = {"name": mname, "mean": mean, "q05": q05, "q95": q95}
+        if idx < 4:
+            mp = monthly_state_probs(am, scsmi, idx)
+            if mp is not None:
+                entry.update(mp)
+        series.append(entry)
     return series
+
+
+# ------------------------------------------------------------ 逐月细化 ----
+
+def monthly_climatology(scsmi, idx):
+    """第 idx 月（0=6月..3=9月）全样本三档气候态频率（Dirichlet 先验用）。"""
+    cnt = {s: 0.0 for s in STATES}
+    n = 0.0
+    for y in scsmi:
+        row = scsmi.get(y, {}).get("norm")
+        if row is None or row[idx] is None:
+            continue
+        cnt[state_of(row[idx])] += 1.0
+        n += 1.0
+    if n <= 0:
+        return {s: 1.0 / 3.0 for s in STATES}
+    return {s: cnt[s] / n for s in STATES}
+
+
+def monthly_state_probs(am, scsmi, idx, marginal=None, prior=PRIOR_STRENGTH,
+                        seed=MC_SEED, draws=MC_DRAWS, mc=True):
+    """相似型近邻对第 idx 月标准化值的三档加权计票 + Dirichlet 后验 90% 区间。
+    与 JJAS 组合区间同一 MC 约定（固定种子，可复现）；mc=False 时返回解析后验均值。"""
+    if am is None:
+        return None
+    wmap = dict(zip(am["years"], am["weights"]))
+    counts = {s: 0.0 for s in STATES}
+    tw = 0.0
+    sqw = 0.0
+    for y2 in am["years"]:
+        row = scsmi.get(y2, {}).get("norm")
+        if row is None or row[idx] is None:
+            continue
+        w = wmap.get(y2, 0.0)
+        counts[state_of(row[idx])] += w
+        tw += w
+        sqw += w * w
+    if tw <= 1e-12:
+        return None
+    p = {s: counts[s] / tw for s in STATES}
+    n_eff = tw * tw / sqw if sqw > 0 else 0.0
+    if marginal is None:
+        marginal = monthly_climatology(scsmi, idx)
+    alpha = {s: prior * marginal.get(s, 0.0) + max(n_eff, 0.5) * p[s] for s in STATES}
+    if not mc:
+        tot_a = sum(alpha.values())
+        return {"probs": {s: alpha[s] / tot_a for s in STATES},
+                "ci_lo": {}, "ci_hi": {}, "n_eff": n_eff}
+    rng = random.Random(seed + idx)
+    acc = {s: [] for s in STATES}
+    for _ in range(draws):
+        xs = [rng.gammavariate(max(alpha[s], 1e-9), 1.0) for s in STATES]
+        tot = sum(xs)
+        for i, s in enumerate(STATES):
+            acc[s].append(xs[i] / tot)
+    mean = {s: sum(acc[s]) / draws for s in STATES}
+    lo, hi = {}, {}
+    for s in STATES:
+        v = sorted(acc[s])
+        lo[s] = v[int(0.05 * (draws - 1))]
+        hi[s] = v[int(0.95 * (draws - 1))]
+    return {"probs": mean, "ci_lo": lo, "ci_hi": hi, "n_eff": n_eff}
+
+
+def strong_month_dist(am, scsmi):
+    """偏强月数（6-9 月中标准化值 >= +0.5 的个数）的相似型加权分布。
+    返回长度 5 的列表（k=0..4）或 None。"""
+    if am is None:
+        return None
+    wmap = dict(zip(am["years"], am["weights"]))
+    dist = [0.0] * 5
+    tw = 0.0
+    for y2 in am["years"]:
+        row = scsmi.get(y2, {}).get("norm")
+        if row is None or any(row[i] is None for i in range(4)):
+            continue
+        k = sum(1 for i in range(4) if row[i] >= THRESHOLD)
+        dist[k] += wmap.get(y2, 0.0)
+        tw += wmap.get(y2, 0.0)
+    if tw <= 1e-12:
+        return None
+    return [d / tw for d in dist]
+
+
+def compute_monthly_calibration(oni, soi, scsmi, verify_years=None):
+    """逐月（6/7/8/9）校准：全部起报月合并的三分类逐月 Brier 技能 + 10 桶命中率。
+    与 JJAS 校准同一无泄漏口径（历史预测只用起报时点之前的数据）。"""
+    ys = verify_years if verify_years is not None else target_years(scsmi)
+    ys = [y for y in ys if y >= VERIFY_START]
+    marginals = [monthly_climatology(scsmi, i) for i in range(4)]
+    acc = [{
+        "buckets": {s: [[0.0, 0.0, 0.0] for _ in range(10)] for s in STATES},
+        "counts": {s: 0 for s in STATES},
+        "bs": 0.0, "obs": [], "n": 0.0,
+    } for _ in range(4)]
+    for m in range(1, 13):
+        for y in ys:
+            comp = shrunk_components(oni, soi, scsmi, y, m)
+            am = comp.get("analog_monthly") or comp.get("analog_pooled")
+            if am is None:
+                continue
+            row = scsmi.get(y, {}).get("norm")
+            for idx in range(4):
+                if row is None or row[idx] is None:
+                    continue
+                mp = monthly_state_probs(am, scsmi, idx, marginal=marginals[idx])
+                if mp is None:
+                    continue
+                obs_s = state_of(row[idx])
+                a = acc[idx]
+                a["n"] += 1.0
+                a["counts"][obs_s] += 1
+                a["obs"].append(obs_s)
+                for s in STATES:
+                    p = mp["probs"][s]
+                    a["bs"] += (p - (1.0 if s == obs_s else 0.0)) ** 2 / 3.0
+                    b = int(min(9, max(0, math.floor(p * 10.0))))
+                    if p >= 0.999999:
+                        b = 9
+                    a["buckets"][s][b][0] += p
+                    a["buckets"][s][b][1] += 1
+                    if s == obs_s:
+                        a["buckets"][s][b][2] += 1.0
+    out = {}
+    for idx, a in enumerate(acc):
+        n = a["n"]
+        if n <= 0:
+            out[idx] = None
+            continue
+        clim = {s: a["counts"][s] / n for s in STATES}
+        bs_clim = sum(sum((clim[s] - (1.0 if s == o else 0.0)) ** 2 for s in STATES) / 3.0
+                       for o in a["obs"]) / n
+        skill = 1.0 - (a["bs"] / n) / bs_clim if bs_clim > 0 else 0.0
+        series = {}
+        for s in STATES:
+            pts = []
+            for b in range(10):
+                cnt = a["buckets"][s][b][1]
+                if cnt == 0:
+                    pts.append(None)
+                    continue
+                pts.append((b, a["buckets"][s][b][2] / cnt,
+                            a["buckets"][s][b][0] / cnt, cnt))
+            series[s] = pts
+        out[idx] = {"buckets": series, "skill": skill,
+                    "bs": a["bs"] / n, "bs_clim": bs_clim,
+                    "n": int(n), "clim": clim}
+    return out
 
 
 # ------------------------------------------------------------ 在线预测 ----
@@ -953,6 +1107,7 @@ def run_forecast(allow_network=True, today=None, json_out=None):
                                   comp["alpha_trans"], comp["alpha_analog"])
     analogs = top_analogs(comp, scsmi)
     pf = point_forecast(comp, scsmi)
+    smd = strong_month_dist(comp.get("analog_monthly") or comp.get("analog_pooled"), scsmi)
 
     result = {
         "target_year": y_t, "issue_month": m,
@@ -965,7 +1120,7 @@ def run_forecast(allow_network=True, today=None, json_out=None):
         "lam_trans": comp["lam_trans"], "lam_analog": comp["lam_analog"],
         "analog_degraded": comp["analog_degraded"],
         "n_eff_analog": comp["n_eff_analog"],
-        "analogs": analogs, "point_forecast": pf,
+        "analogs": analogs, "point_forecast": pf, "strong_month_dist": smd,
         "oni_latest": latest_oni(oni), "soi_latest": latest_soi(soi),
         "oni_state_desc": describe_oni_state(oni, y_t if m <= 5 else y_t - 1, m),
         "last_scsmi_year": last_target,
@@ -1035,6 +1190,21 @@ def print_forecast(res):
             else:
                 parts.append("%s %+.2f [%+.2f, %+.2f]" % (p["name"], p["mean"], p["q05"], p["q95"]))
         print("  " + "  ".join(parts))
+    mp_rows = [p for p in (res.get("point_forecast") or []) if p.get("probs")]
+    if mp_rows:
+        print("夏季逐月状态概率（相似型加权 ±0.5σ 三档，90% 区间）：")
+        for p in mp_rows:
+            pr, lo_, hi_ = p["probs"], p["ci_lo"], p["ci_hi"]
+            print("  %s   偏强 %5.1f%% [%4.1f - %4.1f]   正常 %5.1f%% [%4.1f - %4.1f]"
+                  "   偏弱 %5.1f%% [%4.1f - %4.1f]" % (
+                      p["name"],
+                      100 * pr[STATE_STRONG], 100 * lo_[STATE_STRONG], 100 * hi_[STATE_STRONG],
+                      100 * pr[STATE_NORMAL], 100 * lo_[STATE_NORMAL], 100 * hi_[STATE_NORMAL],
+                      100 * pr[STATE_WEAK], 100 * lo_[STATE_WEAK], 100 * hi_[STATE_WEAK]))
+        if res.get("strong_month_dist"):
+            print("  偏强月数(6-9月)分布  %s" % "  ".join(
+                "%d个月 %5.1f%%" % (i, 100 * q)
+                for i, q in enumerate(res["strong_month_dist"])))
     print("-" * 72)
     print("常规起报窗口：每年 1-5 月（提前 5-1 个月）。本输出为 %d 月提前展望，" % m)
     print("回测表明提前期越长技能越低，请结合技能面板解读。本工具为统计演示，不构成任何决策依据。")
@@ -1255,11 +1425,18 @@ table.heat .cell.lab{background:#f7f9fc}
 .footer{color:#99a;font-size:12px;text-align:center;margin:26px 0 8px;line-height:1.7}
 .tag{display:inline-block;background:#eef2f8;border-radius:4px;padding:1px 7px;font-size:11.5px;color:#556;margin-right:5px}
 a{color:#2d5f9e}
+.dim{color:#889;font-size:11px}
+.sm{display:flex;align-items:center;gap:8px;margin:4px 0}
+.smk{width:52px;font-size:12px;color:#556;flex:none}
+.smbar{flex:1;background:#e8edf5;height:10px;border-radius:5px;overflow:hidden}
+.smbar div{height:10px;border-radius:5px}
+.smp{width:52px;font-size:12px;color:#334;text-align:right;flex:none}
+h3{font-size:13.5px;color:#445;margin:14px 0 6px}
 svg{max-width:100%;display:block;margin:0 auto}
 """
 
 
-def build_report_html(res, skills, calib, scsmi, allow_network):
+def build_report_html(res, skills, calib, scsmi, allow_network, mcalib=None):
     y_t = res["target_year"]
     m = res["issue_month"]
     oni_l, soi_l = res["oni_latest"], res["soi_latest"]
@@ -1314,6 +1491,59 @@ def build_report_html(res, skills, calib, scsmi, allow_network):
     rel_html = _svg_reliability(calib)
     heat_html = _skill_table(skills)
 
+    # 逐月状态概率 / 偏强月数分布 / 逐月校准
+    mp_rows = ""
+    if res.get("point_forecast"):
+        for p in res["point_forecast"]:
+            if not p.get("probs"):
+                continue
+            cells = "".join(
+                '<td>%4.1f%% <span class="dim">(%4.1f - %4.1f)</span></td>' % (
+                    100 * p["probs"][s], 100 * p["ci_lo"][s], 100 * p["ci_hi"][s])
+                for s in STATES)
+            mp_rows += "<tr><td>%s</td>%s</tr>" % (esc(p["name"]), cells)
+    smd_html = ""
+    if res.get("strong_month_dist"):
+        bars = "".join(
+            '<div class="sm"><span class="smk">%d个月</span>'
+            '<div class="smbar"><div style="width:%d%%"></div></div>'
+            '<span class="smp">%4.1f%%</span></div>'
+            % (i, max(0, int(round(100 * q))), 100 * q)
+            for i, q in enumerate(res["strong_month_dist"]))
+        smd_html = '<h3>偏强月数（6-9 月中 ≥ +0.5σ 的月数）分布</h3>%s' % bars
+    mcl_html = ""
+    if mcalib:
+        rows_mc = ""
+        names = ["6月", "7月", "8月", "9月"]
+        for idx in range(4):
+            d = mcalib.get(idx)
+            if d is None:
+                rows_mc += '<tr><td>%s</td><td colspan="3">样本不足</td></tr>' % names[idx]
+                continue
+            rows_mc += ('<tr><td>%s</td><td>%d</td><td>%+.3f</td>'
+                        '<td>%4.1f%% / %4.1f%% / %4.1f%%</td></tr>' % (
+                            names[idx], d["n"], d["skill"],
+                            100 * d["clim"][STATE_STRONG], 100 * d["clim"][STATE_NORMAL],
+                            100 * d["clim"][STATE_WEAK]))
+        mcl_html = ('<h3>逐月三档概率的历史校准（全部起报月合并）</h3>'
+                    '<table><thead><tr><th>月份</th><th>样本</th>'
+                    '<th>Brier 技能（vs 逐月气候态）</th>'
+                    '<th>气候态频率 强/正常/弱</th></tr></thead><tbody>%s</tbody></table>'
+                    '<p class="note">技能为负表示逐月三档概率同样不优于气候态，'
+                    '表中概率应谨慎解读，仅作结构展示。</p>' % rows_mc)
+    mon_card = ""
+    if mp_rows or smd_html or mcl_html:
+        head = ""
+        if mp_rows:
+            head = ('<table><thead><tr><th>月份</th><th>偏强</th><th>正常</th><th>偏弱</th>'
+                    '</tr></thead><tbody>%s</tbody></table>' % mp_rows)
+        mon_card = ('<div class="card"><h2>夏季逐月状态概率（相似型加权计票）</h2>'
+                    + head + smd_html + mcl_html
+                    + '<p class="note">逐月三档概率由相似型近邻对当月标准化值加权计票 + '
+                      'Dirichlet 后验蒙特卡洛 90% 区间。季节平均态会掩盖月内反向信号，'
+                      '请与上方逐月强度曲线交叉解读。</p>'
+                    + '</div>')
+
     skt = res.get("skill_trans")
     ska = res.get("skill_analog")
     skb = res.get("skill_blend")
@@ -1366,6 +1596,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network):
 %s
 <p class="note">纵轴为 SCSMI 标准化值；±0.5σ 线即三档判定的阈值。该曲线由相似型近邻加权得到，转移模型不参与。</p>
 </div>
+%s
 <div class="card">
 <h2>历史南海夏季风指数（%d-%d 年，JJAS 标准化）</h2>
 %s
@@ -1397,6 +1628,8 @@ def build_report_html(res, skills, calib, scsmi, allow_network):
 <b>收缩与组合：</b>起报月分层（同月样本）与全历史估计按 λ = n/(n+24) 经验贝叶斯收缩；
 组合权重按样本外三分类 Brier 技能分分配，负技能剔除，双负等权。<br>
 <b>区间：</b>90%% 区间来自 Dirichlet 后验蒙特卡洛（固定种子，1500 次）。<br>
+<b>逐月细化：</b>6/7/8/9 月各自的三档概率由相似型近邻对当月标准化值加权计票 + Dirichlet 后验
+90%% 区间；偏强月数（≥+0.5σ 的月数）分布同源统计。<br>
 <b>提前期约定：</b>起报月 m≤5 时目标为同年 JJAS（6-9 月），m≥6 时目标为次年 JJAS；提前期 = 距 6 月的月数。<br>
 <b>数据源：</b>
 <span class="tag">SCSMI <a href="http://lijianping.cn/dct/page/65578">lijianping.cn</a></span>
@@ -1429,7 +1662,7 @@ def build_report_html(res, skills, calib, scsmi, allow_network):
         y_t, cards_html,
         res["w_trans"], res["w_analog"], MONTH_CN[m], fmt3(skt), fmt3(ska), fmt3(skb),
         res["n_verify"] if res["n_verify"] is not None else 0,
-        analog_table, pf_html,
+        analog_table, pf_html, mon_card,
         first_yr, last_yr, hist_html, heat_html, rel_html,
         res["data_end_year"],
         len(res["target_years_full"]), first_yr, last_yr,
@@ -1670,6 +1903,62 @@ def run_selftest(verbose=True):
     _check("点预测-分位有序", all(p["mean"] is None or (p["q05"] <= p["mean"] <= p["q95"])
                                    for p in pf), "")
 
+    # ---- 逐月细化 ----
+    am_live = comp_live.get("analog_monthly") or comp_live.get("analog_pooled")
+    mp0 = monthly_state_probs(am_live, scsmi, 0)
+    _check("逐月-结构", mp0 is not None and abs(sum(mp0["probs"].values()) - 1.0) < 1e-6 and
+           mp0["n_eff"] > 0, "")
+    _check("逐月-区间覆盖并含均值", all(mp0["ci_lo"][s] <= mp0["probs"][s] <= mp0["ci_hi"][s]
+                                      for s in STATES), "")
+    _check("逐月-并入点预测", all((pf[i].get("probs") is not None) == (pf[i]["mean"] is not None)
+                                for i in range(4)) and not pf[4].get("probs"), "")
+    # 符号翻转对称性：翻转全部 SCSMI 值后偏强/偏弱逐月后验概率应精确互换（解析模式）
+    flip = {y: {"norm": [(-v if v is not None else None) for v in d["norm"]]}
+            for y, d in scsmi.items()}
+    comp_flip = shrunk_components(oni, soi, flip, 1995, 5)
+    am_flip = comp_flip.get("analog_monthly") or comp_flip.get("analog_pooled")
+    ok_flip = am_flip is not None and am_flip["years"] == am_live["years"] and \
+        all(abs(a - b) < 1e-12 for a, b in zip(am_live["weights"], am_flip["weights"]))
+    for idx in range(4):
+        m1 = monthly_state_probs(am_live, scsmi, idx, mc=False)
+        m2 = monthly_state_probs(am_flip, flip, idx, mc=False)
+        ok_flip = ok_flip and m1 is not None and m2 is not None and \
+            _close(m1["probs"][STATE_STRONG], m2["probs"][STATE_WEAK], 1e-9) and \
+            _close(m1["probs"][STATE_WEAK], m2["probs"][STATE_STRONG], 1e-9) and \
+            _close(m1["probs"][STATE_NORMAL], m2["probs"][STATE_NORMAL], 1e-9)
+    _check("逐月-符号翻转对称", ok_flip, "")
+    smd = strong_month_dist(am_live, scsmi)
+    _check("逐月-偏强月数分布", smd is not None and _close(sum(smd), 1.0, 1e-9) and
+           all(0 <= q <= 1 for q in smd), "")
+    # 构造极小合成样例验证计票与守卫
+    mini = {1990: {"norm": [0.9, 0.9, 0.9, 0.9, 1.0]},
+            1991: {"norm": [-0.9, -0.9, -0.9, -0.9, -1.0]}}
+    mini_am = {"years": [1990, 1991], "weights": [0.7, 0.3]}
+    smd2 = strong_month_dist(mini_am, mini)
+    _check("逐月-偏强月数合成对照", smd2 is not None and _close(smd2[4], 0.7, 1e-9) and
+           _close(smd2[0], 0.3, 1e-9), "")
+    mp_mini = monthly_state_probs(mini_am, mini, 0)
+    _check("逐月-计票方向性", mp_mini is not None and
+           mp_mini["probs"][STATE_STRONG] > mp_mini["probs"][STATE_WEAK], "")
+    mini_nom = {y: {"norm": [None, None, None, None, None]} for y in (1990, 1991)}
+    _check("逐月-缺测守卫", monthly_state_probs(mini_am, mini_nom, 0) is None and
+           strong_month_dist(mini_am, mini_nom) is None, "")
+    # 逐月校准结构
+    mcal = compute_monthly_calibration(oni, soi, scsmi)
+    ok_mcal = all(k in mcal for k in range(4))
+    for idx in range(4):
+        d = mcal.get(idx)
+        if d is None:
+            continue
+        ok_mcal = ok_mcal and d["n"] >= 1 and -2.0 <= d["skill"] <= 1.0 and \
+            all(len(d["buckets"][s]) == 10 for s in STATES) and \
+            abs(sum(d["clim"].values()) - 1.0) < 1e-9
+        for s in STATES:
+            for row in d["buckets"][s]:
+                if row is not None:
+                    ok_mcal = ok_mcal and 0 <= row[1] <= 1 and 0 <= row[2] <= 1 and row[3] >= 1
+    _check("逐月校准-结构", ok_mcal, "")
+
     # ---- 在线上下文 ----
     _check("在线上下文-10月", live_context(datetime.date(2026, 10, 23)) == (2027, 10), "")
     _check("在线上下文-3月", live_context(datetime.date(2027, 3, 15)) == (2027, 3), "")
@@ -1737,7 +2026,8 @@ def main():
         ys = target_years(scsmi)
         skills = compute_skills(oni, soi, scsmi, ys)
         calib = compute_calibration(oni, soi, scsmi, ys)
-        report = build_report_html(res, skills, calib, scsmi, allow_network)
+        mcalib = compute_monthly_calibration(oni, soi, scsmi, ys)
+        report = build_report_html(res, skills, calib, scsmi, allow_network, mcalib)
         out_path = args.out or os.path.join(OUTPUT_DIR, "monsoon_report.html")
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         with open(out_path, "w", encoding="utf-8") as f:
